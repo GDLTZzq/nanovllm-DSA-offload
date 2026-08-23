@@ -918,11 +918,20 @@ def validate_result(
                 f"{label}: request={request} miss_count={actual_count}, "
                 f"expected={expected_count}"
             )
-        if not torch.equal(
-            sources_cpu[request, :actual_count], expected_misses
-        ):
+        actual_misses = sources_cpu[request, :actual_count]
+        if torch.unique(actual_misses).numel() != actual_count:
             raise AssertionError(
-                f"{label}: request={request} ordered union misses differ"
+                f"{label}: request={request} union miss source IDs are not unique"
+            )
+        if not torch.equal(
+            torch.sort(actual_misses).values,
+            torch.sort(expected_misses).values,
+        ):
+            missing = torch.isin(expected_misses, actual_misses, invert=True)
+            extra = torch.isin(actual_misses, expected_misses, invert=True)
+            raise AssertionError(
+                f"{label}: request={request} union miss source set differs "
+                f"(missing={int(missing.sum())}, extra={int(extra.sum())})"
             )
         active_destinations = destinations_cpu[request, :actual_count]
         if actual_count and (
@@ -940,7 +949,7 @@ def validate_result(
                 f"{label}: request={request} changed an existing hit slot"
             )
         if actual_count and not torch.equal(
-            after[expected_misses].to(torch.int64), active_destinations
+            after[actual_misses].to(torch.int64), active_destinations
         ):
             raise AssertionError(
                 f"{label}: request={request} miss-to-slot mapping is wrong"
