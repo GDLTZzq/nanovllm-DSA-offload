@@ -14,8 +14,8 @@ using namespace LIKernel;
 using namespace AscendC;
 
 #define LI_MTP_COPY_TILING()                                                                                           \
-    GET_TILING_DATA_WITH_STRUCT(FusedLiManageTilingData, tiling_data_in, tiling);                                      \
-    const FusedLiManageTilingData *__restrict tiling_data = &tiling_data_in
+    GET_TILING_DATA_WITH_STRUCT(FusedLiManageMtpTilingData, tiling_data_in, tiling);                                      \
+    const FusedLiManageMtpTilingData *__restrict tiling_data = &tiling_data_in
 
 #define INVOKE_LI_MTP_TOPK(...)                                                                                        \
     do {                                                                                                               \

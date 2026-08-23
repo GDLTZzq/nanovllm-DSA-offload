@@ -15,12 +15,12 @@
 
 namespace optiling {
 
-struct HMRequiredParaInfo {
+struct MtpRequiredParaInfo {
     const gert::CompileTimeTensorDesc *desc;
     const gert::StorageShape *shape;
 };
 
-struct HMTensorParaInfo {
+struct MtpTensorParaInfo {
     const gert::CompileTimeTensorDesc *desc;
     const gert::StorageShape *shape;
 };
@@ -51,7 +51,7 @@ constexpr uint32_t DECODE_HEAD_DIM = 128;
 constexpr uint32_t DECODE_SPARSE_COUNT = 2048;
 constexpr uint32_t DECODE_OUTPUT_CAPACITY = 2048;
 
-BEGIN_TILING_DATA_DEF(FusedLiManageTilingData)
+BEGIN_TILING_DATA_DEF(FusedLiManageMtpTilingData)
 TILING_DATA_FIELD_DEF(uint32_t, bSize)
 TILING_DATA_FIELD_DEF(uint32_t, s2Size)
 TILING_DATA_FIELD_DEF(uint32_t, usedCoreNum)
@@ -62,33 +62,33 @@ TILING_DATA_FIELD_DEF(uint32_t, n1Size)
 TILING_DATA_FIELD_DEF(uint32_t, cacheSlotsSize)
 TILING_DATA_FIELD_DEF(uint32_t, scheduleMode)
 END_TILING_DATA_DEF
-REGISTER_TILING_DATA_CLASS(NanovllmFusedLiManageMtp, FusedLiManageTilingData)
+REGISTER_TILING_DATA_CLASS(NanovllmFusedLiManageMtp, FusedLiManageMtpTilingData)
 
-struct FusedLiManageCompileInfo {};
+struct FusedLiManageMtpCompileInfo {};
 
-struct FusedLiManageParaInfo {
-    HMRequiredParaInfo query = {nullptr, nullptr};
-    HMRequiredParaInfo key = {nullptr, nullptr};
-    HMRequiredParaInfo weights = {nullptr, nullptr};
-    HMTensorParaInfo reqPoolEntries = {nullptr, nullptr};
-    HMRequiredParaInfo cacheSlots = {nullptr, nullptr};
-    HMTensorParaInfo cacheTokens = {nullptr, nullptr};
-    HMTensorParaInfo actualSeqLengths = {nullptr, nullptr};
-    HMTensorParaInfo blockTable = {nullptr, nullptr};
-    HMRequiredParaInfo topkIndexOut = {nullptr, nullptr};
-    HMRequiredParaInfo topkSlotsOut = {nullptr, nullptr};
-    HMRequiredParaInfo missCountOut = {nullptr, nullptr};
-    HMRequiredParaInfo missSrcOut = {nullptr, nullptr};
-    HMRequiredParaInfo missSlotsOut = {nullptr, nullptr};
-    HMRequiredParaInfo cacheSlotsOut = {nullptr, nullptr};
+struct FusedLiManageMtpParaInfo {
+    MtpRequiredParaInfo query = {nullptr, nullptr};
+    MtpRequiredParaInfo key = {nullptr, nullptr};
+    MtpRequiredParaInfo weights = {nullptr, nullptr};
+    MtpTensorParaInfo reqPoolEntries = {nullptr, nullptr};
+    MtpRequiredParaInfo cacheSlots = {nullptr, nullptr};
+    MtpTensorParaInfo cacheTokens = {nullptr, nullptr};
+    MtpTensorParaInfo actualSeqLengths = {nullptr, nullptr};
+    MtpTensorParaInfo blockTable = {nullptr, nullptr};
+    MtpRequiredParaInfo topkIndexOut = {nullptr, nullptr};
+    MtpRequiredParaInfo topkSlotsOut = {nullptr, nullptr};
+    MtpRequiredParaInfo missCountOut = {nullptr, nullptr};
+    MtpRequiredParaInfo missSrcOut = {nullptr, nullptr};
+    MtpRequiredParaInfo missSlotsOut = {nullptr, nullptr};
+    MtpRequiredParaInfo cacheSlotsOut = {nullptr, nullptr};
 };
 
-class FusedLiManageTilingInfo {
+class FusedLiManageMtpTilingInfo {
 public:
     const char *opName = nullptr;
     fe::PlatFormInfos *platformInfo = nullptr;
     platform_ascendc::SocVersion socVersion = platform_ascendc::SocVersion::ASCEND910B;
-    FusedLiManageParaInfo opParamInfo;
+    FusedLiManageMtpParaInfo opParamInfo;
 
     uint32_t bSize = 0;
     uint32_t n1Size = 32;
@@ -103,21 +103,21 @@ public:
     ge::DataType inputQType = ge::DT_FLOAT16;
 };
 
-class FusedLiManageTiling {
+class FusedLiManageMtpTiling {
 public:
-    explicit FusedLiManageTiling(gert::TilingContext *context, bool mtp = true)
+    explicit FusedLiManageMtpTiling(gert::TilingContext *context, bool mtp = true)
         : context_(context), mtp_(mtp) {};
-    ge::graphStatus ParseAndCheck(FusedLiManageTilingInfo &tilingInfo);
-    ge::graphStatus DoTiling(FusedLiManageTilingInfo *tilingInfo);
+    ge::graphStatus ParseAndCheck(FusedLiManageMtpTilingInfo &tilingInfo);
+    ge::graphStatus DoTiling(FusedLiManageMtpTilingInfo *tilingInfo);
 
 private:
-    ge::graphStatus GetNpuInfo(FusedLiManageTilingInfo &tilingInfo) const;
-    ge::graphStatus GetTensorInfo(FusedLiManageTilingInfo &tilingInfo) const;
-    ge::graphStatus CheckDtype(const FusedLiManageTilingInfo &tilingInfo) const;
-    ge::graphStatus CheckShape(FusedLiManageTilingInfo &tilingInfo) const;
+    ge::graphStatus GetNpuInfo(FusedLiManageMtpTilingInfo &tilingInfo) const;
+    ge::graphStatus GetTensorInfo(FusedLiManageMtpTilingInfo &tilingInfo) const;
+    ge::graphStatus CheckDtype(const FusedLiManageMtpTilingInfo &tilingInfo) const;
+    ge::graphStatus CheckShape(FusedLiManageMtpTilingInfo &tilingInfo) const;
 
     gert::TilingContext *context_ = nullptr;
-    FusedLiManageTilingData tilingData_;
+    FusedLiManageMtpTilingData tilingData_;
     bool mtp_ = true;
 };
 

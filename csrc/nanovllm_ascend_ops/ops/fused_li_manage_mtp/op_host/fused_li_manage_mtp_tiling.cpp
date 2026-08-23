@@ -11,7 +11,7 @@ using namespace AscendC;
 
 namespace optiling {
 
-ge::graphStatus FusedLiManageTiling::GetNpuInfo(FusedLiManageTilingInfo &tilingInfo) const
+ge::graphStatus FusedLiManageMtpTiling::GetNpuInfo(FusedLiManageMtpTilingInfo &tilingInfo) const
 {
     if (context_->GetNodeName() == nullptr) {
         OPS_LOG_E("NanovllmFusedLiManageMtp", "opName got from TilingContext is nullptr.");
@@ -41,7 +41,7 @@ ge::graphStatus FusedLiManageTiling::GetNpuInfo(FusedLiManageTilingInfo &tilingI
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedLiManageTiling::GetTensorInfo(FusedLiManageTilingInfo &tilingInfo) const
+ge::graphStatus FusedLiManageMtpTiling::GetTensorInfo(FusedLiManageMtpTilingInfo &tilingInfo) const
 {
     auto &op = tilingInfo.opParamInfo;
     op.query.desc = context_->GetInputDesc(QUERY_INDEX);
@@ -110,7 +110,7 @@ ge::graphStatus FusedLiManageTiling::GetTensorInfo(FusedLiManageTilingInfo &tili
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedLiManageTiling::CheckDtype(const FusedLiManageTilingInfo &tilingInfo) const
+ge::graphStatus FusedLiManageMtpTiling::CheckDtype(const FusedLiManageMtpTilingInfo &tilingInfo) const
 {
     const auto &op = tilingInfo.opParamInfo;
     ge::DataType qType = op.query.desc->GetDataType();
@@ -144,7 +144,7 @@ ge::graphStatus FusedLiManageTiling::CheckDtype(const FusedLiManageTilingInfo &t
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedLiManageTiling::CheckShape(FusedLiManageTilingInfo &tilingInfo) const
+ge::graphStatus FusedLiManageMtpTiling::CheckShape(FusedLiManageMtpTilingInfo &tilingInfo) const
 {
     const auto &op = tilingInfo.opParamInfo;
     const auto &qShape = op.query.shape->GetStorageShape();
@@ -265,7 +265,7 @@ ge::graphStatus FusedLiManageTiling::CheckShape(FusedLiManageTilingInfo &tilingI
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedLiManageTiling::ParseAndCheck(FusedLiManageTilingInfo &tilingInfo)
+ge::graphStatus FusedLiManageMtpTiling::ParseAndCheck(FusedLiManageMtpTilingInfo &tilingInfo)
 {
     if (GetNpuInfo(tilingInfo) != ge::GRAPH_SUCCESS || GetTensorInfo(tilingInfo) != ge::GRAPH_SUCCESS ||
         CheckDtype(tilingInfo) != ge::GRAPH_SUCCESS || CheckShape(tilingInfo) != ge::GRAPH_SUCCESS) {
@@ -274,7 +274,7 @@ ge::graphStatus FusedLiManageTiling::ParseAndCheck(FusedLiManageTilingInfo &tili
     return ge::GRAPH_SUCCESS;
 }
 
-ge::graphStatus FusedLiManageTiling::DoTiling(FusedLiManageTilingInfo *tilingInfo)
+ge::graphStatus FusedLiManageMtpTiling::DoTiling(FusedLiManageMtpTilingInfo *tilingInfo)
 {
     auto ascendcPlatform = platform_ascendc::PlatformAscendC(tilingInfo->platformInfo);
     uint32_t aivNum = ascendcPlatform.GetCoreNumAiv();
@@ -361,8 +361,8 @@ ge::graphStatus TilingForNanovllmFusedLiManageMtp(gert::TilingContext *context)
     OPS_ERR_IF(context == nullptr,
                OPS_REPORT_VECTOR_INNER_ERR("NanovllmFusedLiManageMtp", "Tiling context is null."),
                return ge::GRAPH_FAILED);
-    FusedLiManageTilingInfo liInfo;
-    FusedLiManageTiling liTiling(context, true);
+    FusedLiManageMtpTilingInfo liInfo;
+    FusedLiManageMtpTiling liTiling(context, true);
     if (liTiling.ParseAndCheck(liInfo) != ge::GRAPH_SUCCESS) {
         return ge::GRAPH_FAILED;
     }
@@ -371,6 +371,6 @@ ge::graphStatus TilingForNanovllmFusedLiManageMtp(gert::TilingContext *context)
 
 IMPL_OP_OPTILING(NanovllmFusedLiManageMtp)
     .Tiling(TilingForNanovllmFusedLiManageMtp)
-    .TilingParse<FusedLiManageCompileInfo>(TilingPrepareForNanovllmFusedLiManageMtp);
+    .TilingParse<FusedLiManageMtpCompileInfo>(TilingPrepareForNanovllmFusedLiManageMtp);
 
 } // namespace optiling

@@ -60,7 +60,7 @@ public:
                                 __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices, __gm__ uint8_t *sparseValues,
                                 __gm__ uint8_t *unionPair0, __gm__ uint8_t *unionPair1,
                                 __gm__ uint8_t *scoreScratch, __gm__ uint8_t *thresholdScratch,
-                                __gm__ uint8_t *workspace, const FusedLiManageTilingData *__restrict tiling, TPipe *tPipe);
+                                __gm__ uint8_t *workspace, const FusedLiManageMtpTilingData *__restrict tiling, TPipe *tPipe);
     __aicore__ inline void Process();
 
     // =================================类型定义区=================================
@@ -129,7 +129,7 @@ protected:
     LICommon::SplitCoreInfo splitCoreInfo{};
 
     // ================================Init functions==================================
-    __aicore__ inline void InitTilingData(const FusedLiManageTilingData *__restrict tilingData);
+    __aicore__ inline void InitTilingData(const FusedLiManageMtpTilingData *__restrict tilingData);
     __aicore__ inline void InitBuffers();
     __aicore__ inline void InitActualSeqLen(__gm__ uint8_t *actualSeqLengthsQ, __gm__ uint8_t *actualSeqLengths);
     // ================================Split Core================================
@@ -153,7 +153,7 @@ protected:
 };
 
 template <typename LIT>
-__aicore__ inline void LIPreload<LIT>::InitTilingData(const FusedLiManageTilingData *__restrict tilingData)
+__aicore__ inline void LIPreload<LIT>::InitTilingData(const FusedLiManageMtpTilingData *__restrict tilingData)
 {
     usedCoreNum = tilingData->usedCoreNum;
     constInfo.batchSize = tilingData->bSize;
@@ -387,7 +387,7 @@ __aicore__ inline void LIPreload<LIT>::Init(__gm__ uint8_t *query, __gm__ uint8_
                                             __gm__ uint8_t *blockTable, __gm__ uint8_t *sparseIndices, __gm__ uint8_t *sparseValues,
                                             __gm__ uint8_t *unionPair0, __gm__ uint8_t *unionPair1,
                                             __gm__ uint8_t *scoreScratch, __gm__ uint8_t *thresholdScratch,
-                                            __gm__ uint8_t *workspace, const FusedLiManageTilingData *__restrict tiling,
+                                            __gm__ uint8_t *workspace, const FusedLiManageMtpTilingData *__restrict tiling,
                                             TPipe *tPipe)
 {
     if ASCEND_IS_AIV {
