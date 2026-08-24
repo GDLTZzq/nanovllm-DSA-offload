@@ -288,7 +288,7 @@ __aicore__ inline uint32_t QuantLightningIndexerKernel<QLIT>::GetS2BaseBlockNumO
     return (validS2Len + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
 }
 
-template <typename QLIT>
+template <typename QLIT> 
 __aicore__ inline uint32_t QuantLightningIndexerKernel<QLIT>::GetTotalBaseBlockNum()
 {
     uint32_t totalBlockNum = 0;
@@ -311,10 +311,10 @@ __aicore__ inline uint32_t QuantLightningIndexerKernel<QLIT>::GetTotalBaseBlockN
     }
     return totalBlockNum;
 }
-
-
-// 多核版本，双闭区间。基本原则：计算每个核最少处理的块数, 剩余的部分前面的核每个核多处理一块
-template <typename QLIT>
+ 
+ 
+// 多核版本，双闭区间。基本原则：计算每个核最少处理的块数, 剩余的部分前面的核每个核多处理一块 
+template <typename QLIT> 
 __aicore__ void inline QuantLightningIndexerKernel<QLIT>::SplitCore(uint32_t curCoreIdx, uint32_t &coreNum,
                                                 QLICommon::SplitCoreInfo &info)
 {

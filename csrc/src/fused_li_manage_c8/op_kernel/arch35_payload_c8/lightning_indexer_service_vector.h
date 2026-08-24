@@ -131,10 +131,10 @@ private:
     LocalTensor<QK_T> resMm1UB_;
     // tmp buff for weight
     TBuf<TPosition::VECCALC> weightBuf_;
-    LocalTensor<W_T> weightUB_;
+    LocalTensor<W_T> weightUB_; 
     // tmp buff for weight cast float
     TBuf<TPosition::VECCALC> weightFloatBuf_;
-    LocalTensor<float> weightFloatUB_;
+    LocalTensor<float> weightFloatUB_;  
     // tmp buff for kScale
     TBuf<TPosition::VECCALC> kScaleBuf_;
     LocalTensor<SCALE_T> kScaleUB_;
