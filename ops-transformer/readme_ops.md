@@ -27,8 +27,9 @@ S1 = query 侧实际 token 数，S2 = key 侧实际 token 数。当 maxS2 超过
 **metadata 只依赖 shape/长度/参数，不依赖 tensor 数值**——actual_seq_lengths
 不变时可缓存复用，不必每次重算。
 
+## 2. npu-smi info  检查npu状态
 
-## 2. 构建并安装 custom vendor 包
+## 3. 构建并安装 custom vendor 包
 
 
 `torch_ops_extension` 的 aclnn 调用层通过 `EXEC_NPU_CMD_V1` 宏在运行时
@@ -37,17 +38,14 @@ S1 = query 侧实际 token 数，S2 = key 侧实际 token 数。当 maxS2 超过
 
 ```bash
 # 从gitcode仓库上 clone master分支
-
+https://gitcode.com/cann/ops-transformer.git
 
 #编译安装
+bash build.sh --pkg --experimental --soc=ascend950 --ops=quant_lightning_indexer,quant_lightning_indexer_metadata
+./build_out/cann-ops-transformer-custom_linux-x86_64.run --install-path={your_install_path}
 
-
-# 在 ops-transformer 仓库根目录按 README 构建 custom_transformer 包
-# （产物含 vendors/custom_transformer/op_api/lib/libcust_opapi.so、
-#   kernel .o、aicpu 等），并安装到工作目录，例如：
-#   <WORK>/qli_custom/vendors/custom_transformer
-# 然后 source 其环境（每开新终端都要执行）：
-source <WORK>/qli_custom/vendors/custom_transformer/bin/set_env.bash
+#可以先不着急source,在步骤5时再source也行
+source {your_install_path}/vendors/custom_transformer/bin/set_env.bash
 
 # 验证环境变量
 echo "$ASCEND_CUSTOM_OPP_PATH"   # 必须指向 custom_transformer
