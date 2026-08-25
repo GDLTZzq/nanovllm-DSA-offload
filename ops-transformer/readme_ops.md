@@ -37,10 +37,14 @@ S1 = query 侧实际 token 数，S2 = key 侧实际 token 数。当 maxS2 超过
 
 ```bash
 # 从gitcode仓库上 clone master分支
-
+https://gitcode.com/cann/ops-transformer.git
 
 #编译安装
+bash build.sh --pkg --experimental --soc=ascend950 --ops=quant_lightning_indexer,quant_lightning_indexer_metadata
+./build_out/cann-ops-transformer-custom_linux-x86_64.run --install-path={your_install_path}
 
+#可以先不着急source,在步骤5时再source也行
+source {your_install_path}/vendors/custom_transformer/bin/set_env.bash
 
 # 在 ops-transformer 仓库根目录按 README 构建 custom_transformer 包
 # （产物含 vendors/custom_transformer/op_api/lib/libcust_opapi.so、
