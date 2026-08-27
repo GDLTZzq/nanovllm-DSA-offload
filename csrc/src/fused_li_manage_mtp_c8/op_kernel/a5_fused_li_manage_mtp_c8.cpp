@@ -1,463 +1,64 @@
 /**
- * One-kernel Ascend 950 C8 MTP LightningIndexer + request-pool manager.
+ * Copyright (c) 2026 Huawei Technologies Co., Ltd.
+ */
+
+/*!
+ * \file a5_fused_li_manage_mtp_c8.cpp
+ * \brief Decode-only fused C8 MTP LightningIndexer + request-pool cache update kernel.
  *
- * The MIX phase first computes official sparse-mode-3 top-2048 rows for all
- * 2--4 packed verification queries.  Queries are intentionally serialized
- * within each request in this correctness-first version.  The even AIV then
- * resets its TPipe and, within the same device launch, forms the request
- * union, preserves hits, selects victims, updates one request-pool row and
- * publishes every query's complete HBM slot row.
+ * 单算子融合，与 BF16 版 A5FusedLiManageMtp 同构（同一份 LightningIndexer 骨架），
+ * C8 差异与 A5FusedLiManageC8 一致：
+ *   1. fp8 cube 打分（Mmad fp8×fp8→fp32 累加）+ Fixpipe<float 直通>；
+ *   2. 无 ×1/1024、无 fp16 往返（QK 保持 fp32，relu 由 vf 完成，
+ *      与官方"Relu在cube随路做"数值等价）；
+ *   3. weight×qScale 预乘 + kScale 经 vf 6 参重载在 Σ 后乘。
+ * MTP 特有：每请求 2~4 个 packed query 逐行 top-2048（token-only，MODE 0
+ * payload），AIV0 在 SyncAll 后做请求级并集 + 一次性缓存更新 + 逐 query
+ * 发布 slot 行。
  */
 
 #include "kernel_operator.h"
-#include "a5_fused_li_manage_mtp_c8_tiling.h"
-#include "a5_fused_li_manage_mtp_c8_qli.h"
+#include "lib/matmul_intf.h"
+#include "a5_fused_li_manage_mtp_c8_template_tiling_key.h"
+#include "a5_fused_li_manage_mtp_c8_kernel.h"
 
-namespace {
-using namespace AscendC;
+using namespace QLIKernel;
 
-constexpr uint32_t SPARSE_COUNT = 2048;
-constexpr uint32_t MAX_QUERIES_PER_REQUEST = 4;
-constexpr uint32_t MIN_QUERIES_PER_REQUEST = 2;
-constexpr uint32_t UNION_CAPACITY =
-    SPARSE_COUNT * MAX_QUERIES_PER_REQUEST;
-constexpr uint32_t UNION_HASH_CAPACITY = 16384;
-constexpr uint32_t UNION_HASH_MASK = UNION_HASH_CAPACITY - 1;
-constexpr uint32_t MAX_CACHE_TOKENS = 16256;
-constexpr uint32_t CACHE_CHUNK = 2048;
-constexpr uint32_t TOKEN_MASK = (1U << 18) - 1U;
-constexpr uint32_t SLOT_SHIFT = 18;
+#define INVOKE_LI_NO_KFC_OP_IMPL(templateClass, ...)                                                   \
+    do {                                                                                               \
+        templateClass<QLIType<__VA_ARGS__>> op;                                                        \
+        LI_COPY_TILING_DATA(LIMtpC8TilingData, tiling);                                                \
+        op.Init(query, key, weights, queryDequantScale, keyDequantScale,                               \
+                actualSeqLengthsQuery, reqPoolEntries, cacheSlotsPool, cacheTokens,                    \
+                candidateLens, blockTable, topkDestinationSlots, missSourceIds,                        \
+                missDestinationSlots, missCounts,                                                      \
+                user, tiling_data, &tPipe);                                                            \
+        op.Process();                                                                                  \
+    } while (0)
 
-class A5FusedLiManageMtpC8RequestPoolManager {
-public:
-    __aicore__ inline A5FusedLiManageMtpC8RequestPoolManager(
-        TPipe *pipe,
-        const A5FusedLiManageMtpC8TilingData *tiling)
-        : pipe_(pipe), tiling_(tiling)
-    {}
+#define LI_COPY_TILING_DATA(tilingDataStruct, tiling)                                                  \
+    GET_TILING_DATA_WITH_STRUCT(tilingDataStruct, tiling_data_in, tiling);                             \
+    const tilingDataStruct *__restrict tiling_data = &tiling_data_in;
 
-    __aicore__ inline void Init(
-        GM_ADDR topkIndices,
-        GM_ADDR actualSeqLengthsQuery,
-        GM_ADDR reqPoolEntries,
-        GM_ADDR cacheSlotsPool,
-        GM_ADDR cacheTokens,
-        GM_ADDR candidateLens,
-        GM_ADDR topkDestinationSlots,
-        GM_ADDR missSourceIds,
-        GM_ADDR missDestinationSlots,
-        GM_ADDR missCounts)
-    {
-        // This manager runs only on AIV0 of each MIX_AIC_1_2 group.
-        coreIdx_ = GetBlockIdx() / 2U;
-        topkIndicesGm_.SetGlobalBuffer((__gm__ int32_t *)topkIndices);
-        actualSeqLengthsQueryGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)actualSeqLengthsQuery);
-        reqPoolEntriesGm_.SetGlobalBuffer((__gm__ int32_t *)reqPoolEntries);
-        cacheSlotsPoolGm_.SetGlobalBuffer((__gm__ int32_t *)cacheSlotsPool);
-        cacheTokensGm_.SetGlobalBuffer((__gm__ int32_t *)cacheTokens);
-        candidateLensGm_.SetGlobalBuffer((__gm__ int32_t *)candidateLens);
-        topkDestinationSlotsGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)topkDestinationSlots);
-        missSourceIdsGm_.SetGlobalBuffer((__gm__ int32_t *)missSourceIds);
-        missDestinationSlotsGm_.SetGlobalBuffer(
-            (__gm__ int32_t *)missDestinationSlots);
-        missCountsGm_.SetGlobalBuffer((__gm__ int32_t *)missCounts);
-
-        pipe_->InitBuffer(
-            unionHashBuf_, UNION_HASH_CAPACITY * sizeof(int32_t));
-        pipe_->InitBuffer(
-            missTokensBuf_, UNION_CAPACITY * sizeof(int32_t));
-        pipe_->InitBuffer(
-            victimPayloadsBuf_, UNION_CAPACITY * sizeof(uint32_t));
-        pipe_->InitBuffer(
-            topkTokensBuf_, SPARSE_COUNT * sizeof(int32_t));
-        pipe_->InitBuffer(
-            topkSlotsBuf_, SPARSE_COUNT * sizeof(int32_t));
-        pipe_->InitBuffer(
-            cacheChunkBuf_, CACHE_CHUNK * sizeof(int32_t));
-    }
-
-    __aicore__ inline void Process()
-    {
-        for (uint32_t batch = coreIdx_; batch < tiling_->batchSize;
-             batch += tiling_->usedCoreNum) {
-            ProcessRequest(batch);
-        }
-    }
-
-private:
-    __aicore__ inline uint32_t MinU32(uint32_t left, uint32_t right) const
-    {
-        return left < right ? left : right;
-    }
-
-    __aicore__ inline bool InsertUnion(
-        LocalTensor<int32_t> unionHash, uint32_t token) const
-    {
-        uint32_t hashPos = (token * 2654435761U) & UNION_HASH_MASK;
-        for (uint32_t probe = 0; probe < UNION_HASH_CAPACITY; ++probe) {
-            const int32_t stored = unionHash.GetValue(hashPos);
-            if (stored == static_cast<int32_t>(token)) {
-                return false;
-            }
-            if (stored < 0) {
-                unionHash.SetValue(hashPos, static_cast<int32_t>(token));
-                return true;
-            }
-            hashPos = (hashPos + 1U) & UNION_HASH_MASK;
-        }
-        return false;
-    }
-
-    __aicore__ inline bool ContainsUnion(
-        LocalTensor<int32_t> unionHash, uint32_t token) const
-    {
-        uint32_t hashPos = (token * 2654435761U) & UNION_HASH_MASK;
-        for (uint32_t probe = 0; probe < UNION_HASH_CAPACITY; ++probe) {
-            const int32_t stored = unionHash.GetValue(hashPos);
-            if (stored == static_cast<int32_t>(token)) {
-                return true;
-            }
-            if (stored < 0) {
-                return false;
-            }
-            hashPos = (hashPos + 1U) & UNION_HASH_MASK;
-        }
-        return false;
-    }
-
-    __aicore__ inline void LoadTopk(
-        uint32_t queryRow, LocalTensor<int32_t> topkTokens)
-    {
-        DataCopyExtParams copy{
-            1, SPARSE_COUNT * sizeof(int32_t), 0, 0, 0};
-        DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-        DataCopyPad<int32_t, PaddingMode::Normal>(
-            topkTokens,
-            topkIndicesGm_[
-                static_cast<uint64_t>(queryRow) * SPARSE_COUNT],
-            copy,
-            pad);
-        SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-        WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    }
-
-    __aicore__ inline void StoreTopkSlots(
-        uint32_t queryRow, LocalTensor<int32_t> topkSlots)
-    {
-        DataCopyExtParams copy{
-            1, SPARSE_COUNT * sizeof(int32_t), 0, 0, 0};
-        SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
-        WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
-        DataCopyPad<int32_t, PaddingMode::Normal>(
-            topkDestinationSlotsGm_[
-                static_cast<uint64_t>(queryRow) * SPARSE_COUNT],
-            topkSlots,
-            copy);
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
-        WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
-    }
-
-    __aicore__ inline void StoreMissCount(
-        uint32_t batch, int32_t value, LocalTensor<int32_t> scratch)
-    {
-        scratch.SetValue(0, value);
-        DataCopyParams copy{1, static_cast<uint16_t>(sizeof(int32_t)), 0, 0};
-        SetFlag<HardEvent::S_MTE3>(EVENT_ID2);
-        WaitFlag<HardEvent::S_MTE3>(EVENT_ID2);
-        DataCopyPad(missCountsGm_[batch], scratch, copy);
-        SetFlag<HardEvent::MTE3_S>(EVENT_ID2);
-        WaitFlag<HardEvent::MTE3_S>(EVENT_ID2);
-    }
-
-    __aicore__ inline void PublishInvalidRows(
-        uint32_t queryBegin,
-        uint32_t queryEnd,
-        LocalTensor<int32_t> topkSlots)
-    {
-        Duplicate(topkSlots, static_cast<int32_t>(-1), SPARSE_COUNT);
-        PipeBarrier<PIPE_V>();
-        SetFlag<HardEvent::V_S>(EVENT_ID3);
-        WaitFlag<HardEvent::V_S>(EVENT_ID3);
-        for (uint32_t queryRow = queryBegin;
-             queryRow < queryEnd; ++queryRow) {
-            StoreTopkSlots(queryRow, topkSlots);
-        }
-    }
-
-    __aicore__ inline void ProcessRequest(uint32_t batch)
-    {
-        LocalTensor<int32_t> unionHash = unionHashBuf_.Get<int32_t>();
-        LocalTensor<int32_t> missTokens = missTokensBuf_.Get<int32_t>();
-        LocalTensor<uint32_t> victimPayloads =
-            victimPayloadsBuf_.Get<uint32_t>();
-        LocalTensor<int32_t> topkTokens = topkTokensBuf_.Get<int32_t>();
-        LocalTensor<int32_t> topkSlots = topkSlotsBuf_.Get<int32_t>();
-        LocalTensor<int32_t> cacheChunk = cacheChunkBuf_.Get<int32_t>();
-
-        const int32_t queryEndValue =
-            actualSeqLengthsQueryGm_.GetValue(batch);
-        const int32_t queryBeginValue = batch == 0
-            ? 0
-            : actualSeqLengthsQueryGm_.GetValue(batch - 1);
-        uint32_t safeQueryBegin = queryBeginValue < 0
-            ? 0U
-            : static_cast<uint32_t>(queryBeginValue);
-        uint32_t safeQueryEnd = queryEndValue < queryBeginValue
-            ? safeQueryBegin
-            : static_cast<uint32_t>(queryEndValue);
-        safeQueryBegin = MinU32(safeQueryBegin, tiling_->packedQueryCount);
-        safeQueryEnd = MinU32(safeQueryEnd, tiling_->packedQueryCount);
-        const int32_t queryCountValue = queryEndValue - queryBeginValue;
-        const int32_t budgetValue = cacheTokensGm_.GetValue(batch);
-        const int32_t candidateValue = candidateLensGm_.GetValue(batch);
-        const int32_t poolRowValue = reqPoolEntriesGm_.GetValue(batch);
-
-        if (queryBeginValue < 0 || queryEndValue < queryBeginValue ||
-            queryEndValue > static_cast<int32_t>(tiling_->packedQueryCount) ||
-            queryCountValue < static_cast<int32_t>(MIN_QUERIES_PER_REQUEST) ||
-            queryCountValue > static_cast<int32_t>(MAX_QUERIES_PER_REQUEST)) {
-            PublishInvalidRows(safeQueryBegin, safeQueryEnd, topkSlots);
-            StoreMissCount(batch, -1, topkTokens);
-            return;
-        }
-        const uint32_t queryBegin = static_cast<uint32_t>(queryBeginValue);
-        const uint32_t queryEnd = static_cast<uint32_t>(queryEndValue);
-        if (budgetValue == 0) {
-            PublishInvalidRows(queryBegin, queryEnd, topkSlots);
-            StoreMissCount(batch, 0, topkTokens);
-            return;
-        }
-        if (budgetValue < static_cast<int32_t>(SPARSE_COUNT) ||
-            budgetValue > static_cast<int32_t>(MAX_CACHE_TOKENS) ||
-            candidateValue < static_cast<int32_t>(SPARSE_COUNT) ||
-            candidateValue > static_cast<int32_t>(tiling_->sourceCapacity) ||
-            poolRowValue < 0 ||
-            poolRowValue >= static_cast<int32_t>(tiling_->poolSize)) {
-            PublishInvalidRows(queryBegin, queryEnd, topkSlots);
-            StoreMissCount(batch, -1, topkTokens);
-            return;
-        }
-
-        const uint32_t budget = static_cast<uint32_t>(budgetValue);
-        const uint32_t candidateLen = static_cast<uint32_t>(candidateValue);
-        const uint64_t cacheBase =
-            static_cast<uint64_t>(poolRowValue) * tiling_->sourceCapacity;
-        Duplicate(
-            unionHash, static_cast<int32_t>(-1), UNION_HASH_CAPACITY);
-        PipeBarrier<PIPE_V>();
-        SetFlag<HardEvent::V_S>(EVENT_ID3);
-        WaitFlag<HardEvent::V_S>(EVENT_ID3);
-
-        uint32_t unionCount = 0;
-        uint32_t missCount = 0;
-        bool validTopk = true;
-        for (uint32_t queryRow = queryBegin;
-             queryRow < queryEnd; ++queryRow) {
-            LoadTopk(queryRow, topkTokens);
-            for (uint32_t index = 0; index < SPARSE_COUNT; ++index) {
-                const int32_t tokenValue = topkTokens.GetValue(index);
-                if (tokenValue < 0 || tokenValue >= candidateValue) {
-                    validTopk = false;
-                    continue;
-                }
-                const uint32_t token = static_cast<uint32_t>(tokenValue);
-                if (!InsertUnion(unionHash, token)) {
-                    continue;
-                }
-                ++unionCount;
-                if (cacheSlotsPoolGm_.GetValue(cacheBase + token) < 0) {
-                    if (missCount >= UNION_CAPACITY) {
-                        validTopk = false;
-                        continue;
-                    }
-                    missTokens.SetValue(missCount++, tokenValue);
-                }
-            }
-        }
-        if (!validTopk || unionCount > budget ||
-            missCount > UNION_CAPACITY) {
-            PublishInvalidRows(queryBegin, queryEnd, topkSlots);
-            StoreMissCount(batch, -1, topkTokens);
-            return;
-        }
-
-        uint32_t victimCount = 0;
-        DataCopyPadExtParams<int32_t> pad{false, 0, 0, 0};
-        for (uint32_t chunkBase = 0;
-             chunkBase < candidateLen && victimCount < missCount;
-             chunkBase += CACHE_CHUNK) {
-            const uint32_t chunkLen = MinU32(
-                CACHE_CHUNK, candidateLen - chunkBase);
-            DataCopyExtParams copy{
-                1,
-                static_cast<uint32_t>(chunkLen * sizeof(int32_t)),
-                0,
-                0,
-                0};
-            DataCopyPad<int32_t, PaddingMode::Normal>(
-                cacheChunk,
-                cacheSlotsPoolGm_[cacheBase + chunkBase],
-                copy,
-                pad);
-            SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-            WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-            for (uint32_t offset = 0;
-                 offset < chunkLen && victimCount < missCount; ++offset) {
-                const int32_t slotValue = cacheChunk.GetValue(offset);
-                if (slotValue < 0 || slotValue >= budgetValue) {
-                    continue;
-                }
-                const uint32_t token = chunkBase + offset;
-                if (ContainsUnion(unionHash, token)) {
-                    continue;
-                }
-                const uint32_t payload =
-                    (static_cast<uint32_t>(slotValue) << SLOT_SHIFT) |
-                    (token & TOKEN_MASK);
-                victimPayloads.SetValue(victimCount++, payload);
-            }
-        }
-        if (victimCount != missCount) {
-            PublishInvalidRows(queryBegin, queryEnd, topkSlots);
-            StoreMissCount(batch, -1, topkTokens);
-            return;
-        }
-
-        for (uint32_t index = 0; index < missCount; ++index) {
-            const uint32_t payload = victimPayloads.GetValue(index);
-            const uint32_t victimToken = payload & TOKEN_MASK;
-            const uint32_t slot = payload >> SLOT_SHIFT;
-            const uint32_t missToken = static_cast<uint32_t>(
-                missTokens.GetValue(index));
-            cacheSlotsPoolGm_.SetValue(cacheBase + victimToken, -1);
-            cacheSlotsPoolGm_.SetValue(
-                cacheBase + missToken, static_cast<int32_t>(slot));
-            victimPayloads.SetValue(index, slot);
-        }
-        PipeBarrier<PIPE_ALL>();
-
-        if (missCount > 0) {
-            DataCopyExtParams copy{
-                1,
-                static_cast<uint32_t>(missCount * sizeof(int32_t)),
-                0,
-                0,
-                0};
-            const uint64_t missBase =
-                static_cast<uint64_t>(batch) * UNION_CAPACITY;
-            SetFlag<HardEvent::S_MTE3>(EVENT_ID1);
-            WaitFlag<HardEvent::S_MTE3>(EVENT_ID1);
-            DataCopyPad<int32_t, PaddingMode::Normal>(
-                missSourceIdsGm_[missBase], missTokens, copy);
-            DataCopyPad<int32_t, PaddingMode::Normal>(
-                missDestinationSlotsGm_[missBase],
-                victimPayloads.ReinterpretCast<int32_t>(),
-                copy);
-            SetFlag<HardEvent::MTE3_S>(EVENT_ID1);
-            WaitFlag<HardEvent::MTE3_S>(EVENT_ID1);
-        }
-
-        for (uint32_t queryRow = queryBegin;
-             queryRow < queryEnd; ++queryRow) {
-            LoadTopk(queryRow, topkTokens);
-            for (uint32_t index = 0; index < SPARSE_COUNT; ++index) {
-                const int32_t tokenValue = topkTokens.GetValue(index);
-                const int32_t slot = tokenValue < 0
-                    ? -1
-                    : cacheSlotsPoolGm_.GetValue(
-                          cacheBase + static_cast<uint32_t>(tokenValue));
-                topkSlots.SetValue(index, slot);
-            }
-            StoreTopkSlots(queryRow, topkSlots);
-        }
-        StoreMissCount(
-            batch, static_cast<int32_t>(missCount), topkTokens);
-    }
-
-private:
-    TPipe *pipe_;
-    const A5FusedLiManageMtpC8TilingData *tiling_;
-    uint32_t coreIdx_ = 0;
-    GlobalTensor<int32_t> topkIndicesGm_;
-    GlobalTensor<int32_t> actualSeqLengthsQueryGm_;
-    GlobalTensor<int32_t> reqPoolEntriesGm_;
-    GlobalTensor<int32_t> cacheSlotsPoolGm_;
-    GlobalTensor<int32_t> cacheTokensGm_;
-    GlobalTensor<int32_t> candidateLensGm_;
-    GlobalTensor<int32_t> topkDestinationSlotsGm_;
-    GlobalTensor<int32_t> missSourceIdsGm_;
-    GlobalTensor<int32_t> missDestinationSlotsGm_;
-    GlobalTensor<int32_t> missCountsGm_;
-    TBuf<TPosition::VECCALC> unionHashBuf_;
-    TBuf<TPosition::VECCALC> missTokensBuf_;
-    TBuf<TPosition::VECCALC> victimPayloadsBuf_;
-    TBuf<TPosition::VECCALC> topkTokensBuf_;
-    TBuf<TPosition::VECCALC> topkSlotsBuf_;
-    TBuf<TPosition::VECCALC> cacheChunkBuf_;
-};
-}  // namespace
-
-extern "C" __global__ __aicore__ void
-a5_fused_li_manage_mtp_c8(
-    GM_ADDR query,
-    GM_ADDR key,
-    GM_ADDR weights,
-    GM_ADDR queryDequantScale,
-    GM_ADDR keyDequantScale,
-    GM_ADDR actualSeqLengthsQuery,
-    GM_ADDR reqPoolEntries,
-    GM_ADDR cacheSlotsPool,
-    GM_ADDR cacheTokens,
-    GM_ADDR candidateLens,
-    GM_ADDR blockTable,
-    GM_ADDR topkDestinationSlots,
-    GM_ADDR missSourceIds,
-    GM_ADDR missDestinationSlots,
-    GM_ADDR missCounts,
-    GM_ADDR cacheSlotsAlias,
-    GM_ADDR workspace,
-    GM_ADDR tiling)
+template <int DT>
+__global__ __aicore__ void a5_fused_li_manage_mtp_c8(__gm__ uint8_t *query, __gm__ uint8_t *key, __gm__ uint8_t *weights,
+                                                     __gm__ uint8_t *queryDequantScale, __gm__ uint8_t *keyDequantScale,
+                                                     __gm__ uint8_t *actualSeqLengthsQuery, __gm__ uint8_t *reqPoolEntries,
+                                                     __gm__ uint8_t *cacheSlotsPool, __gm__ uint8_t *cacheTokens,
+                                                     __gm__ uint8_t *candidateLens, __gm__ uint8_t *blockTable,
+                                                     __gm__ uint8_t *topkDestinationSlots, __gm__ uint8_t *missSourceIds,
+                                                     __gm__ uint8_t *missDestinationSlots, __gm__ uint8_t *missCounts,
+                                                     __gm__ uint8_t *cacheSlotsAlias,
+                                                     __gm__ uint8_t *workspace, __gm__ uint8_t *tiling)
 {
+    TPipe tPipe;
     (void)cacheSlotsAlias;
+    __gm__ uint8_t *user = GetUserWorkspace(workspace);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
-    REGISTER_TILING_DEFAULT(A5FusedLiManageMtpC8TilingData);
-    GET_TILING_DATA(tilingData, tiling);
-    TPipe pipe;
-    GM_ADDR userWorkspace = GetUserWorkspace(workspace);
-    GM_ADDR topkWorkspace = userWorkspace +
-        static_cast<uint64_t>(tilingData.scoreWorkspaceStride) *
-            tilingData.usedCoreNum;
-
-    a5_fused_li_manage_mtp_c8_impl::QuantLiMtpPhase qli(
-        &pipe, &tilingData);
-    // Keep native token IDs in a dedicated workspace.  The public slot
-    // output is written only by the manager, which avoids read/write aliasing
-    // between packed query rows in this correctness-first implementation.
-    qli.Init(
-        query, key, weights, queryDequantScale, keyDequantScale,
-        actualSeqLengthsQuery, cacheTokens, candidateLens, blockTable,
-        topkWorkspace, userWorkspace);
-    qli.Process();
-
-    pipe.Reset();
-    if ASCEND_IS_AIV {
-        if ((GetBlockIdx() & 1U) == 0U) {
-            A5FusedLiManageMtpC8RequestPoolManager manager(
-                &pipe, &tilingData);
-            manager.Init(
-                topkWorkspace,
-                actualSeqLengthsQuery,
-                reqPoolEntries,
-                cacheSlotsPool,
-                cacheTokens,
-                candidateLens,
-                topkDestinationSlots,
-                missSourceIds,
-                missDestinationSlots,
-                missCounts);
-            manager.Process();
-        }
-    }
+    static_assert(DT == LI_C8_TPL_UINT8, "A5FusedLiManageMtpC8 tiling key must be the uint8 storage id");
+    // 固定组合：fp8_e4m3fn query/key（ops.json 以 uint8 顶替，数据按 fp8 语义处理）
+    // + bf16 weights + fp32 scales + fp32 QK 累加 + uint16 score
+    INVOKE_LI_NO_KFC_OP_IMPL(QuantLightningIndexerKernel, fp8_e4m3fn_t, fp8_e4m3fn_t, int32_t,
+                             1, LI_LAYOUT::TND, LI_LAYOUT::PA_BSND,
+                             bfloat16_t, float32_t, float32_t, uint16_t);
 }

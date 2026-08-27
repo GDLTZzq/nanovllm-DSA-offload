@@ -241,5 +241,23 @@
             {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false},
             {"name": "prefetch_rows_per_step", "param_type": "optional", "type": "int", "default_value": 5}
         ]
+    },
+    {
+        "op": "A5QuantLightningIndexerC8",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "weights", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "query_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "key_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_key", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "attr": []
     }
 ]

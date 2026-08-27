@@ -11,6 +11,21 @@
 | `kvcache_scatter_copy_c8` | `A5KvcacheScatterCopyC8` | packed C8 KV 的 swapped-memory DRAM → HBM 搬运并生成 attention metadata |
 | `sparse_tail_attention_c8` | `A5SparseTailAttentionC8` | packed C8 KV 上的 top-2048 sparse + dense tail MLA |
 
+## `fused_li_manage_c8` 实现
+
+与 BF16 版 `A5FusedLiManage` 同构（同一份 LightningIndexer 骨架），差异收敛为三处：
+
+1. **fp8 cube 打分**：fp8_e4m3fn Mmad（fp32 累加）+ Fixpipe<float 直通>，
+   QK 保持 fp32，无 ×1/1024、无 fp16 往返；
+2. **relu**：在 vf 的 WeightedAccum 中对 fp32 QK 完成（与官方 QuantLI
+   "Relu在cube随路做"数值等价——元素级幂等，作用于相同操作数）；
+3. **反量化 scale**：weightFloat = float(weight)×qScale（fp32 域）预乘，
+   kScale 经 BF16 版 vf 的 6 参重载在 Σ 之后乘。
+
+乘权归约/bf16-sortable 复用 BF16 版的 `lightning_indexer_vector1.h`，
+top-2048 直方图与缓存管理 payload 两版完全一致；tiling key 以 uint8 顶替
+fp8 存储类型（ops.json 约定），OpDef 声明真实 fp8 dtype。
+
 ## 接口
 
 ```python

@@ -60,6 +60,7 @@ from .ops import (  # noqa: E402
     kvcache_scatter_copy,
     kvcache_scatter_copy_c8,
     kvcache_scatter_copy_c8_out,
+    quant_lightning_indexer_c8,
     sparse_tail_attention,
     sparse_tail_attention_c8,
 )
@@ -83,5 +84,6 @@ __all__ = [
     "sparse_tail_attention",
     "fused_copy_sparse_tail_attention",
     "sparse_tail_attention_c8",
+    "quant_lightning_indexer_c8",
     "local_opapi_path",
 ]

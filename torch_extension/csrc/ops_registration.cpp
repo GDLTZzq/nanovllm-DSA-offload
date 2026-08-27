@@ -96,6 +96,11 @@ TORCH_LIBRARY(nanovllm_dsa, m) {
       "Tensor source_token_ids, Tensor copy_counts, float scale_value, "
       "int prefetch_rows_per_step=5) "
       "-> (Tensor, Tensor(b!), Tensor(a!))");
+  m.def(
+      "quant_lightning_indexer_c8(Tensor query, Tensor key, Tensor weights, "
+      "Tensor query_dequant_scale, Tensor key_dequant_scale, "
+      "Tensor actual_seq_lengths_query, Tensor actual_seq_lengths_key, "
+      "Tensor block_table) -> Tensor");
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {}

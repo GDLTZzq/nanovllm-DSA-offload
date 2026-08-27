@@ -161,10 +161,10 @@ def custom_namespace() -> object:
 
 
 def custom_metadata(inputs: Inputs, device: torch.device) -> torch.Tensor:
-    if inputs.heads != 64:
+    if inputs.heads not in (32, 64):
         raise ValueError(
-            f"custom QLI metadata requires num_heads_q=64, got {inputs.heads}; "
-            "run with --heads 64"
+            f"custom QLI metadata requires num_heads_q in {{32, 64}}, got "
+            f"{inputs.heads}; run with --heads 32 or --heads 64"
         )
     namespace = custom_namespace()
     metadata = namespace.npu_quant_lightning_indexer_metadata(
