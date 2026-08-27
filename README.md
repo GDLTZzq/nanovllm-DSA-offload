@@ -1,6 +1,11 @@
 
 本仓库提供 A5 下 quant_lightning_indexer_c8算子，为解决原qli算子小batch下线性度不足的问题。
 
+其中ops-transfomer下的cann官方实验性算子，编译与测试参考文件夹内的md文件，该算子被拆分为了2个算子来完成，并且不支持heads = 32。
+
+csrc下的quant_lightning_indexer_c8为当前实现的算子，实现了单算子逻辑与对heads = 32的支持。
+
+
 
 ## 编译
 
