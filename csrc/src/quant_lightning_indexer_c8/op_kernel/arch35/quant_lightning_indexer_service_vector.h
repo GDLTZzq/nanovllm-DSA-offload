@@ -27,6 +27,10 @@
 namespace QLIKernel {
 using namespace QLICommon;
 constexpr uint32_t TRUNK_LEN_16K = 16384;
+// outBase 常驻槽位深度：score 槽从 2 深扩到 4 深，让 MTE3 的 GM 写与下一轮复写拉开 3 块间隔。
+// score 拷贝事件（VEC1_MTE3_V_EVENT / VEC1_V_MTE3_EVENT）随之按槽位（loop%OUT_PINGPONG_DEPTH）分配；
+// 跨核 CV/VC 与 resMm1/weight/qScale/kScale 仍按 loop%2，不放大 CUBE 侧流水。
+constexpr uint32_t OUT_PINGPONG_DEPTH = 4;
 template <typename QLIT>
 class QLIVector {
 public:
@@ -173,7 +177,7 @@ __aicore__ inline void QLIVector<QLIT>::InitBuffers(TPipe *pipe)
     kScaleUB_ = kScaleBuf_.Get<float>();//kScale
     pipe->InitBuffer(qScaleBuf_, 2 * CeilDiv(s1BaseSize_, 2) * UB_BANK_DEPTH_STRIDE);
     qScaleUB_ = qScaleBuf_.Get<float>();//qScale
-    pipe->InitBuffer(outBuf_, 2 * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ * sizeof(SCORE_T));      // 大小：2(开dB) * 2 * 128 * 4 = 2KB
+    pipe->InitBuffer(outBuf_, 2 * CeilDiv(s1BaseSize_, 2) * s2BaseSize_ * sizeof(SCORE_T));      // 大小：2(开dB) * 2 * 128 * 4 = 2KB。outBase 4 深仅需 4×UB_BANK_STRIDE，此尺寸在全部 heads 下 ≥4×256B（heads=64 恰满）
     vec1OutUB_ = outBuf_.Get<SCORE_T>();//out
 
     // Topk
@@ -260,6 +264,8 @@ __aicore__ inline void QLIVector<QLIT>::AllocEventID()
     SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + 1);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 0);
     SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 1);
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 2);
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 3);
     // QSCALE 事件仅 Branch 2（整行 load-once）使用。Branch 1 若预置则 QSCALE+1=EVENT_ID7
     // 会把陈旧置位泄漏进 ProcessTopK 的 V_MTE2_EVENT 自屏障（Set/Wait 立即通过，破坏 V→MTE2 排序）。
     if (isWholeRowGreedy_) {
@@ -279,6 +285,8 @@ __aicore__ inline void QLIVector<QLIT>::FreeEventID()
     WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + 1);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 0);
     WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 1);
+    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 2);
+    WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + 3);
     if (isWholeRowGreedy_) {
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + 0);
         WaitFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_QSCALE + 1);
@@ -367,6 +375,7 @@ template <typename QLIT>
 __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &info)
 {
     auto pingpong = (info.loop % 2);
+    auto outSlot = (info.loop % OUT_PINGPONG_DEPTH);  // outBase 槽 4 深：本块 score 与 GM 拷贝解耦，复写间隔 3 块
     auto qScalepingpong = (info.qScaleLoop % 2);  // 每行+1：weight/qScale 槽位（官方同式）
     auto kScalepingpong = (info.kScaleLoop % 2);  // 每16块+1：kScale 槽位（官方同式）
     auto s1BaseSizePerAIV = CeilDiv(s1BaseSize_, 2);
@@ -383,7 +392,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     }
     int64_t weightGmOffset = info.tensorWeightsOffset + curAivS1Idx * kHeadNum_ * gSize_;
     static_assert(std::is_same_v<SCORE_T, uint16_t>);
-    auto outBase = vec1OutUB_[pingpong * (UB_BANK_STRIDE / sizeof(SCORE_T))];
+    auto outBase = vec1OutUB_[outSlot * (UB_BANK_STRIDE / sizeof(SCORE_T))];
     if (isWholeRowGreedy_) {
         // ===== 官方整行路径：weight/qScale 每行仅首块加载、kScale 每16块批量加载 =====
         if (info.isFirstS2InnerLoop) {
@@ -415,7 +424,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
             SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
             WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + kScalepingpong);
         }
-        WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+        WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + outSlot);
 
         //CV同步
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_CV_EVENT + info.loop % 2);   //V核等C核计算完mm1，mm1Res已搬运到UB
@@ -459,7 +468,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
         GetKeyScale(info, kScaleUB_, info.bIdx, curS2Idx, info.actualSingleProcessSInnerSize);
         SetFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + pingpong);
         WaitFlag<HardEvent::MTE2_V>(VEC1_MTE2_V_EVENT_KSCALE + pingpong);
-        WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+        WaitFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + outSlot);
 
         //CV同步
         CrossCoreWaitFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_CV_EVENT + info.loop % 2);   //V核等C核计算完mm1，mm1Res已搬运到UB
@@ -478,8 +487,8 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
                                             gSize_, curAivS1ProcNum);
         SetFlag<HardEvent::V_MTE2>(VEC1_V_MTE2_EVENT_KSCALE + pingpong);
     }
-    SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
-    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + pingpong);
+    SetFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + outSlot);
+    WaitFlag<HardEvent::V_MTE3>(VEC1_V_MTE3_EVENT + outSlot);
     //outUB_ --->  scoreGm
     int64_t vec1OutGmOffset = blockId_ % 2 == 0 ? curS2Idx : 
                             s1BaseSizePerAIV * QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) + curS2Idx;
@@ -489,7 +498,7 @@ __aicore__ inline void QLIVector<QLIT>::ProcessVec1(const QLICommon::RunInfo &in
     copyOutParams.srcStride = (UB_BANK_DEPTH_STRIDE - UB_BANK_STRIDE) / 32;
     copyOutParams.dstStride = (QLICommon::Align((uint64_t)constInfo_.kSeqSize, (uint64_t)s2BaseSize_) - s2BaseSize_) * sizeof(SCORE_T);
     DataCopyPad(scoreGm[vec1OutGmOffset], outBase, copyOutParams);
-    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + pingpong);
+    SetFlag<HardEvent::MTE3_V>(VEC1_MTE3_V_EVENT + outSlot);
     CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_V>(QLICommon::ConstInfo::CROSS_VC_EVENT + pingpong);   //V核处理完，通知C核可以把mm1Res搬运到UB
 }
 

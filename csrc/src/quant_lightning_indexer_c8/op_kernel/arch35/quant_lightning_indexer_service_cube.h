@@ -213,8 +213,8 @@ __aicore__ inline void QLIMatmul<QLIT>::ComputeMm1(const QLICommon::RunInfo &run
         SetFlag<HardEvent::MTE1_MTE2>(KEY_MTE1_MTE2_EVENT + keyL1BufIdx_ % KEY_BUF_NUM);
         keyL1BufIdx_++;
     }
-    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2); 
-    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2 + QLICommon::ConstInfo::AIV0_AIV1_OFFSET); 
+    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2);
+    CrossCoreSetFlag<QLICommon::ConstInfo::QLI_SYNC_MODE4, PIPE_FIX>(QLICommon::ConstInfo::CROSS_CV_EVENT + runInfo.loop % 2 + QLICommon::ConstInfo::AIV0_AIV1_OFFSET);
 }
 
 template <typename QLIT>

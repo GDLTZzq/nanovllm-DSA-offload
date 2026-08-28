@@ -153,6 +153,12 @@ struct LdSplitCoreInfo {
     uint32_t mStart = 0U;
     uint32_t mNum = 0U;
     uint64_t indiceOutCoreOffset = 0U;  // 最终输出索引搬出Topk的初始偏移地址
+    // 多行核的部分行 slot 查找表：块池切分下本核至多 2 个部分行（首/末），
+    // 每个部分行按 (bN2, gS1) 在 ldSlot* 中查全局 slot（被切分行的 slot 按行主序连续）。
+    uint32_t ldSlotBN2[2] = {0, 0};
+    uint32_t ldSlotGS1[2] = {0, 0};
+    uint32_t ldSlot[2] = {0, 0};
+    uint32_t ldSlotCount = 0U;
 };
 
 struct SplitCoreInfo {

@@ -80,9 +80,10 @@ public:
     static constexpr uint32_t SYNC_V1_C1_FLAG = 5;
 
     static constexpr uint32_t M_BASE_SIZE = 256;
-    // 官方 arch35 的 S1 基本块大小：Branch 2 对齐官方时 s1BaseSize=S1_BASE_SIZE，
-    // tSize≤64 减半 → s1BaseSize=2、mBaseSize=2×gSize。
-    static constexpr uint32_t S1_BASE_SIZE = 4;
+    // s1BaseSize 由 InitTilingData 按 host 公式 ceil(256/gSize) 决定（=8 at gSize=32），
+    // 不要用 S1_BASE_SIZE=4 覆盖：mBaseSize 会降到 128，bufUB_ 减半到 64KB，而 decode 块的
+    // fixpipe 写入足印含不随 mBaseSize 缩小的常数项 (mSize-1)*dstStride≈16KB，净溢出~8K元素
+    // 写穿后续 UB 缓冲 → bs=1 topk 全错。decode 的 actMBaseSize 封顶 32，与 s1BaseSize 无关。
     static constexpr uint32_t S2_BASE_SIZE = 128;
     static constexpr uint32_t HEAD_DIM = 128;
     static constexpr uint32_t K_HEAD_NUM = 1;
@@ -95,12 +96,6 @@ public:
     // MIX_AIC_1_2 下 AIC=24、AIV=48（编译期常量，与 GetBlockNum() 自洽）
     static constexpr uint32_t AIC_CORE_NUM = 24;
     static constexpr uint32_t AIV_CORE_NUM = 48;
-
-    // Branch 1（S2 跨核切分 + LD）仅在整数核数能均分时才有收益：
-    // rowK=floor(24/rowsCount)>=2 ⇔ rowsCount<=12 → 临界路径 ≤ 256 块 < 官方整行 512 块。
-    // rowsCount 13~24 时 rowK=1 → 多数行单核、临界路径退化为整行 512 块，还白付 LD 开销，
-    // 与官方"整行无 LD"结构无异（官方此处还因 s1BaseSize 更小流量更省）→ 直接走官方整行逻辑。
-    static constexpr uint32_t BRANCH1_MAX_ROWS = AIC_CORE_NUM / 2;
 
 protected:
     TPipe *pipe = nullptr;
@@ -202,6 +197,10 @@ __aicore__ inline void QLIPreload<QLIT>::InitTilingData(const QLITilingData *__r
     constInfo.s1BaseSize = (constInfo.mBaseSize + constInfo.gSize - 1) / constInfo.gSize;
     // workspace 步长固定用 host 分配值，不随 Branch 2 的对齐覆盖变化
     constInfo.s1BaseSizeWs = constInfo.s1BaseSize;
+    // 实验：大 batch 走官方 9.1.0 整行贪婪（Branch 2：weight/qScale 每 S1 组仅首块加载一次
+    // + kScale 每 16 块批量），小 batch 保持 Branch 1 逐块加载（块池切分已验证路径）。
+    // 阈值 >16 为初值，A5 全 sweep 正确性 + 性能定稿。
+    constInfo.isWholeRowGreedy = (constInfo.batchSize > 16);
 }
 
 template <typename QLIT>
@@ -348,10 +347,13 @@ __aicore__ inline bool QLIPreload<QLIT>::AdvanceRowCursor(uint32_t &bN2, uint32_
 template <typename QLIT>
 __aicore__ inline void QLIPreload<QLIT>::ComputeSplitInfo(uint32_t cubeCoreIdx, uint32_t vecCoreIdx)
 {
-    // ===== Pass A：统计总行数与总块数（全部按 bN2 主序/gS1 次序）=====
-    uint32_t rowsCount = 0;
+    // s1BaseSize/mBaseSize 保持 InitTilingData 的 host 值（s1BaseSize=ceil(256/gSize)，mBaseSize=256）。
+    // 曾试验 s1BaseSize=4→mBaseSize=128，bufUB_/resMm1Buf_ 减半，而 decode 块 fixpipe 足印
+    // (mSize=64×N=128) 含常数项 ~16KB 不随 mBaseSize 缩小 → 溢出写穿 UB → bs=1 topk 全错。
+    // 块池切分本身不依赖该覆盖（slot 步长走 constInfo.s1BaseSize=8），故保持 256。
+
+    // ===== Pass A：统计总块数（行主序：bN2 主序/gS1 次序，行区间连续铺满 [0,totalBlocks)）=====
     uint32_t totalBlocks = 0;
-    uint32_t rowW[AIC_CORE_NUM], rowB[AIC_CORE_NUM], rowG[AIC_CORE_NUM], rowTailM[AIC_CORE_NUM];
     uint32_t totalBN2 = (uint32_t)(constInfo.batchSize * constInfo.kHeadNum);
     for (uint32_t bN2 = 0; bN2 < totalBN2; bN2++) {
         uint32_t bIdx = bN2 / constInfo.kHeadNum;
@@ -361,7 +363,6 @@ __aicore__ inline void QLIPreload<QLIT>::ComputeSplitInfo(uint32_t cubeCoreIdx, 
             continue;
         }
         uint32_t gS1Num = (actS1Size * constInfo.gSize + constInfo.mBaseSize - 1) / constInfo.mBaseSize;
-        uint32_t lastRow = gS1Num - 1;
         for (uint32_t gS1 = 0; gS1 < gS1Num; gS1++) {
             uint32_t w;
             if (constInfo.attenMaskFlag) {
@@ -369,15 +370,6 @@ __aicore__ inline void QLIPreload<QLIT>::ComputeSplitInfo(uint32_t cubeCoreIdx, 
             } else {
                 w = (actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
             }
-            if (rowsCount < AIC_CORE_NUM) {
-                rowW[rowsCount] = w;
-                rowB[rowsCount] = bN2;
-                rowG[rowsCount] = gS1;
-                uint32_t mSize = (gS1 == lastRow) ? (actS1Size * constInfo.gSize - gS1 * constInfo.mBaseSize)
-                                                  : constInfo.mBaseSize;
-                rowTailM[rowsCount] = mSize / constInfo.gSize;
-            }
-            rowsCount++;
             totalBlocks += w;
         }
     }
@@ -388,260 +380,172 @@ __aicore__ inline void QLIPreload<QLIT>::ComputeSplitInfo(uint32_t cubeCoreIdx, 
         return;
     }
 
-    if (rowsCount <= BRANCH1_MAX_ROWS) {
-        // ===== Apportionment：行数 ≤ 12，把每行按块数比例切给多个核 =====
-        // 每行 k_R 份（1 ≤ k_R ≤ w_R，保证每行至少一个核、行内切点跨核数不超过块数）
-        uint32_t rowK[AIC_CORE_NUM];
-        uint32_t sumK = 0;
-        for (uint32_t i = 0; i < rowsCount; i++) {
-            uint32_t k = (uint32_t)((uint64_t)rowW[i] * AIC_CORE_NUM / totalBlocks);
-            if (k == 0) {
-                k = 1;
-            }
-            if (k > rowW[i]) {
-                k = rowW[i];
-            }
-            rowK[i] = k;
-            sumK += k;
-        }
-        // 补齐到 AIC_CORE_NUM：按最大分数余数加给未饱和行
-        while (sumK < AIC_CORE_NUM) {
-            int32_t best = -1;
-            uint32_t bestFrac = 0;
-            for (uint32_t i = 0; i < rowsCount; i++) {
-                if (rowK[i] < rowW[i]) {
-                    uint32_t frac = (uint32_t)(((uint64_t)rowW[i] * AIC_CORE_NUM) % totalBlocks);
-                    if (best < 0 || frac > bestFrac) {
-                        best = (int32_t)i;
-                        bestFrac = frac;
-                    }
-                }
-            }
-            if (best < 0) {
-                break;  // 全部行已饱和（块数不足），剩余核闲置
-            }
-            rowK[best]++;
-            sumK++;
-        }
-        // 超出则从最大 k_R 行扣回（≥1 保底）
-        while (sumK > AIC_CORE_NUM) {
-            int32_t best = -1;
-            uint32_t bestK = 0;
-            for (uint32_t i = 0; i < rowsCount; i++) {
-                if (rowK[i] > 1 && rowK[i] > bestK) {
-                    best = (int32_t)i;
-                    bestK = rowK[i];
-                }
-            }
-            if (best < 0) {
-                break;
-            }
-            rowK[best]--;
-            sumK--;
-        }
-        uint32_t usedCoreNumLocal = sumK;
-
-        // LD slot 分配：被切分行（k_R ≥ 2）按行序占连续 slot；rowSlot[i] = 行 i 的首个 slot
-        uint32_t rowSlot[AIC_CORE_NUM];
-        uint32_t fdCount = 0;
-        uint32_t fdBN2[AIC_CORE_NUM], fdM[AIC_CORE_NUM], fdW[AIC_CORE_NUM];
-        uint32_t fdSplitNum[AIC_CORE_NUM], fdMSize[AIC_CORE_NUM];
-        uint32_t slotBase = 0;
-        for (uint32_t i = 0; i < rowsCount; i++) {
-            if (rowK[i] >= 2) {
-                fdBN2[fdCount] = rowB[i];
-                fdM[fdCount] = rowG[i];
-                fdW[fdCount] = slotBase;
-                fdSplitNum[fdCount] = rowK[i];
-                fdMSize[fdCount] = rowTailM[i];
-                rowSlot[i] = slotBase;
-                slotBase += rowK[i];
-                fdCount++;
-            } else {
-                rowSlot[i] = 0;
-            }
-        }
-
-        // 本核（AIC 索引 cubeCoreIdx）对应的行内片段 (R, p)
-        uint32_t R = rowsCount;
-        uint32_t p = 0;
-        if (cubeCoreIdx < usedCoreNumLocal) {
-            uint32_t cum = 0;
-            for (uint32_t i = 0; i < rowsCount; i++) {
-                if (cubeCoreIdx < cum + rowK[i]) {
-                    R = i;
-                    p = cubeCoreIdx - cum;
-                    break;
-                }
-                cum += rowK[i];
-            }
-        }
-        if (cubeCoreIdx >= usedCoreNumLocal) {
-            splitCoreInfo.isCoreEnable = false;
-            if ASCEND_IS_AIV {
-                ldInfo.isLdCoreEnable = false;
-            }
-            return;
-        }
-        splitCoreInfo.isCoreEnable = true;
-        splitCoreInfo.bN2Start = splitCoreInfo.bN2End = rowB[R];
-        splitCoreInfo.gS1Start = splitCoreInfo.gS1End = rowG[R];
-        if (rowK[R] >= 2) {
-            splitCoreInfo.s2Start = (p * rowW[R]) / rowK[R];
-            splitCoreInfo.s2End = ((p + 1) * rowW[R]) / rowK[R] - 1;
-            // 该片段写入的 LD slot（写侧 offset = slot * s1BaseSize*T + rowIdx*T）
-            ldInfo.saveWorkSpaceIdx = rowSlot[R] + p;
-        } else {
-            splitCoreInfo.s2Start = 0;
-            splitCoreInfo.s2End = rowW[R] - 1;
-            ldInfo.saveWorkSpaceIdx = 0;
-        }
-
+    // ===== 块池切分：所有行的所有 S2 块汇成池子，按块数均衡分给每个核（arch22 同式）=====
+    // 每核 minBlock=totalBlocks/coreNum 块，前 deal1More=totalBlocks%coreNum 核多 1 块；
+    // 核范围在行主序块空间上连续，可跨多行。只有被 >1 核覆盖的行（内部有核边界）需要 LD。
+    uint32_t coreNum = (totalBlocks < AIC_CORE_NUM) ? totalBlocks : AIC_CORE_NUM;
+    uint32_t minBlock = totalBlocks / coreNum;
+    uint32_t deal1More = totalBlocks % coreNum;
+    if (cubeCoreIdx >= coreNum) {
+        splitCoreInfo.isCoreEnable = false;
         if ASCEND_IS_AIV {
-            // ===== SplitFD：把 fd 归约任务负载均衡分给 48 个 AIV =====
-            if (fdCount == 0) {
-                ldInfo.isLdCoreEnable = false;
-                return;
-            }
-            uint64_t totalFDLoad = 0;
-            for (uint32_t i = 0; i < fdCount; i++) {
-                totalFDLoad += (uint64_t)fdSplitNum[i] * fdMSize[i];
-            }
-            uint64_t averageLoad = (totalFDLoad + AIV_CORE_NUM - 1) / AIV_CORE_NUM;
-            uint32_t fdIdx[AIV_CORE_NUM], fdMStart[AIV_CORE_NUM], fdMNum[AIV_CORE_NUM];
-            uint32_t curCoreIndex = 0;
-            for (uint32_t i = 0; i < fdCount; i++) {
-                uint32_t curFDVectorNum = (uint32_t)((uint64_t)fdSplitNum[i] * fdMSize[i] / averageLoad);
-                curFDVectorNum = Max(1U, curFDVectorNum);
-                uint32_t curAveMSize = (fdMSize[i] + curFDVectorNum - 1) / curFDVectorNum;
-                curFDVectorNum = (fdMSize[i] + curAveMSize - 1) / curAveMSize;
-                for (uint32_t vid = 0; vid < curFDVectorNum; vid++) {
-                    if (curCoreIndex >= AIV_CORE_NUM) {
-                        break;
-                    }
-                    fdIdx[curCoreIndex] = i;
-                    fdMStart[curCoreIndex] = vid * curAveMSize;
-                    fdMNum[curCoreIndex] =
-                        (vid < curFDVectorNum - 1) ? curAveMSize : fdMSize[i] - vid * curAveMSize;
-                    curCoreIndex++;
-                }
-            }
-            if (vecCoreIdx >= curCoreIndex) {
-                ldInfo.isLdCoreEnable = false;
-                return;
-            }
-            uint32_t fi = fdIdx[vecCoreIdx];
-            ldInfo.isLdCoreEnable = true;
-            ldInfo.bn2Idx = fdBN2[fi];
-            ldInfo.bIdx = ldInfo.bn2Idx / constInfo.kHeadNum;
-            ldInfo.n2Idx = ldInfo.bn2Idx % constInfo.kHeadNum;
-            ldInfo.mIdx = fdM[fi];
-            ldInfo.workspaceIdx = fdW[fi];
-            ldInfo.workspaceNum = fdSplitNum[fi];
-            ldInfo.mStart = fdMStart[vecCoreIdx];
-            ldInfo.mNum = fdMNum[vecCoreIdx];
-            uint64_t actualSeqQPrefixSum = 0;
-            if constexpr (Q_LAYOUT_T == LI_LAYOUT::TND) {
-                uint32_t actualSeqLengthsGmQIdx = (constInfo.batchSupperFlag) ? ldInfo.bIdx : ldInfo.bIdx - 1;
-                actualSeqQPrefixSum = (ldInfo.bIdx <= 0) ? 0 : actualSeqLengthsGmQ.GetValue(actualSeqLengthsGmQIdx);
-            } else {  // BSND
-                actualSeqQPrefixSum = (ldInfo.bIdx <= 0) ? 0 : (uint64_t)ldInfo.bIdx * constInfo.qSeqSize;
-            }
-            ldInfo.indiceOutCoreOffset = actualSeqQPrefixSum * constInfo.kHeadNum * constInfo.sparseCount +
-                                         ldInfo.n2Idx * constInfo.sparseCount +
-                                         ldInfo.mIdx * constInfo.s1BaseSize * constInfo.kHeadNum * constInfo.sparseCount;
+            ldInfo.isLdCoreEnable = false;
         }
         return;
     }
+    splitCoreInfo.isCoreEnable = true;
+    uint64_t cb = (uint64_t)cubeCoreIdx * minBlock + ((cubeCoreIdx < deal1More) ? cubeCoreIdx : deal1More);
+    uint64_t ce = (uint64_t)(cubeCoreIdx + 1) * minBlock + ((cubeCoreIdx + 1 < deal1More) ? (cubeCoreIdx + 1) : deal1More);
 
-    // ===== Branch 2 = 官方整行逻辑：base size 对齐官方 arch35 =====
-    // 官方：s1BaseSize = S1_BASE_SIZE(4)，tSize≤64 减半 → decode 各 batch s1BaseSize=2、
-    // mBaseSize=s1BaseSize×gSize（heads=32→64、heads=64→128）。host workspace 仍按
-    // s1BaseSizeWs（旧值）分配，计算值只影响 score/UB 布局（qkVLstride/dstNdStride 均
-    // ∝ mBaseSize 同式缩放、resMm1Buf_ 随之缩小），每核 GM segment 步长由 s1BaseSizeWs 钉死。
-    constInfo.s1BaseSize = (constInfo.batchSize <= 64) ? (S1_BASE_SIZE / 2) : S1_BASE_SIZE;
-    constInfo.mBaseSize = constInfo.s1BaseSize * (uint32_t)constInfo.gSize;
-    constInfo.isWholeRowGreedy = true;
-    // mBaseSize 变化会改 gS1Num（行结构），按新 base size 重算 rowsCount/totalBlocks，
-    // 贪心分组必须按新行结构枚举（decode 各请求 actS1Size=1 → gS1Num 恒为 1，不变）。
-    rowsCount = 0;
-    totalBlocks = 0;
-    for (uint32_t bN2 = 0; bN2 < totalBN2; bN2++) {
-        uint32_t bIdx = bN2 / constInfo.kHeadNum;
-        uint32_t actS1Size, actS2Size, actS2SizeOrig;
-        GetS1S2ActualSeqLen(bIdx, actS1Size, actS2Size, actS2SizeOrig);
-        if (actS1Size == 0 || actS2Size == 0) {
-            continue;
-        }
-        uint32_t gS1Num = (actS1Size * (uint32_t)constInfo.gSize + constInfo.mBaseSize - 1) / constInfo.mBaseSize;
-        for (uint32_t gS1 = 0; gS1 < gS1Num; gS1++) {
-            uint32_t w;
-            if (constInfo.attenMaskFlag) {
-                w = GetS2BaseBlockNumOnMask(gS1, actS1Size, actS2SizeOrig);
-            } else {
-                w = (actS2Size + constInfo.s2BaseSize - 1) / constInfo.s2BaseSize;
-            }
-            rowsCount++;
-            totalBlocks += w;
-        }
-    }
-
-    // ===== Whole-row grouping：行数 > 12，整行贪心分组（无跨核行 → 无 LD）=====
-    // 每核目标 = 剩余块数 / 剩余核数（动态），maxTake 保证每核至少给后续核留 1 行，
-    // 最后一个核（coresLeft==1）maxTake==全部剩余行 —— 从结构上杜绝行被悬空。
+    // ===== Pass B：流式二次枚举行，定位本核范围 [cb,ce) 覆盖的行并统计每行覆盖核数 =====
+    // 每行 touches=覆盖核数，touches>=2 的行占 touches 个连续 slot（slot 布局按行主序）。
+    // fd 归约列表同步收集（AIV 侧 SplitFD 用）；被切分行必含核边界 → fdCount ≤ coreNum-1 ≤ 23。
     uint32_t bN2 = 0;
     uint32_t gS1 = 0;
     InitRowCursor(bN2, gS1);
-    uint32_t rowIdx = 0;
-    uint32_t blocksLeft = totalBlocks;
-    for (uint32_t curCore = 0; curCore < AIC_CORE_NUM && rowIdx < rowsCount; curCore++) {
-        uint32_t coresLeft = AIC_CORE_NUM - curCore;                 // 含当前核
-        uint32_t target = (blocksLeft + coresLeft - 1) / coresLeft;  // 本核目标块数
-        // 至少给后续每核留 1 行；行数 < 剩余核数时无"留行"约束，取全部剩余（weight 上限自会兜底）
-        uint32_t rowsRemaining = rowsCount - rowIdx;
-        uint32_t maxTake = (rowsRemaining >= coresLeft) ? (rowsRemaining - (coresLeft - 1)) : rowsRemaining;
-        uint32_t chunkStartB = bN2;
-        uint32_t chunkStartG = gS1;
-        uint32_t acc = 0;
-        uint32_t took = 0;
-        uint32_t lastB = bN2;
-        uint32_t lastG = gS1;
-        uint32_t lastW = 0;
-        while (took < maxTake) {
-            uint32_t w, tailM;
-            RowCursorInfo(bN2, gS1, w, tailM);
-            if (took > 0 && acc + w > target) {
-                break;
-            }
-            acc += w;
-            took++;
-            lastB = bN2;
-            lastG = gS1;
-            lastW = w;
-            rowIdx++;
-            if (!AdvanceRowCursor(bN2, gS1)) {
-                break;
+    uint32_t blockAcc = 0;   // 当前行的起始块下标（行区间连续，等于已累计块数）
+    uint32_t coreIdxWalk = 0;
+    uint32_t slotCtr = 0;
+    bool isR0 = false;  // 当前行是否为本核范围首块 cb 所在行
+    bool isR1 = false;  // 当前行是否为本核范围末块 ce-1 所在行
+    uint32_t firstCore0 = 0, slot0 = 0, w0 = 0;
+    uint32_t firstCore1 = 0, slot1 = 0, w1 = 0;
+    uint32_t fdCount = 0;
+    uint32_t fdBN2[AIC_CORE_NUM], fdM[AIC_CORE_NUM], fdW[AIC_CORE_NUM];
+    uint32_t fdSplitNum[AIC_CORE_NUM], fdMSize[AIC_CORE_NUM];
+    while (true) {
+        uint32_t w, tailM;
+        RowCursorInfo(bN2, gS1, w, tailM);
+        uint32_t rs = blockAcc;
+        uint32_t re = blockAcc + w;
+        isR0 = (rs <= cb && cb < re);
+        isR1 = (rs <= ce - 1 && ce - 1 < re);
+        if (isR0) {
+            splitCoreInfo.bN2Start = bN2;
+            splitCoreInfo.gS1Start = gS1;
+            splitCoreInfo.s2Start = (cb > rs) ? (uint32_t)(cb - rs) : 0;
+        }
+        if (isR1) {
+            splitCoreInfo.bN2End = bN2;
+            splitCoreInfo.gS1End = gS1;
+            splitCoreInfo.s2End = (uint32_t)(ce - 1 - rs);
+        }
+        while (coreIdxWalk + 1 < coreNum &&
+               (uint64_t)(coreIdxWalk + 1) * minBlock + ((coreIdxWalk + 1 < deal1More) ? (coreIdxWalk + 1) : deal1More) <= rs) {
+            coreIdxWalk++;
+        }
+        uint32_t firstCore = coreIdxWalk;
+        uint32_t touches = 0;
+        uint32_t c = firstCore;
+        while (c < coreNum && (uint64_t)c * minBlock + ((c < deal1More) ? c : deal1More) < re) {
+            touches++;
+            c++;
+        }
+        uint32_t rowSlotBase = 0;
+        if (touches >= 2) {
+            rowSlotBase = slotCtr;
+            slotCtr += touches;
+            if (fdCount < AIC_CORE_NUM) {
+                fdBN2[fdCount] = bN2;
+                fdM[fdCount] = gS1;
+                fdW[fdCount] = rowSlotBase;
+                fdSplitNum[fdCount] = touches;
+                fdMSize[fdCount] = tailM;
+                fdCount++;
             }
         }
-        blocksLeft -= acc;
-        if (curCore == cubeCoreIdx) {
-            splitCoreInfo.isCoreEnable = true;
-            splitCoreInfo.bN2Start = chunkStartB;
-            splitCoreInfo.gS1Start = chunkStartG;
-            splitCoreInfo.s2Start = 0;
-            splitCoreInfo.bN2End = lastB;
-            splitCoreInfo.gS1End = lastG;
-            splitCoreInfo.s2End = lastW - 1;
-            ldInfo.saveWorkSpaceIdx = 0;
-            if ASCEND_IS_AIV {
-                ldInfo.isLdCoreEnable = false;
-            }
-            return;
+        if (isR0) {
+            firstCore0 = firstCore;
+            slot0 = rowSlotBase;
+            w0 = w;
+        }
+        if (isR1) {
+            firstCore1 = firstCore;
+            slot1 = rowSlotBase;
+            w1 = w;
+        }
+        coreIdxWalk = c - 1;
+        blockAcc = re;
+        if (!AdvanceRowCursor(bN2, gS1)) {
+            break;
         }
     }
-    splitCoreInfo.isCoreEnable = false;
+
+    // ===== 本核的部分行 slot：首行部分（范围首块所在行）+ 末行部分（≠首行且未覆盖完整）=====
+    // 被切分行的 slot 按覆盖核序连续（firstCore 得 base、后续核 +1），本核 slot = base + (本核-firstCore)。
+    ldInfo.ldSlotCount = 0;
+    bool isSingleRow = (splitCoreInfo.bN2Start == splitCoreInfo.bN2End) &&
+                       (splitCoreInfo.gS1Start == splitCoreInfo.gS1End);
+    bool firstPartial = (splitCoreInfo.s2Start > 0);
+    if (isSingleRow) {
+        firstPartial = (splitCoreInfo.s2Start > 0) || (splitCoreInfo.s2End < w0 - 1);
+    }
+    if (firstPartial) {
+        ldInfo.ldSlotBN2[ldInfo.ldSlotCount] = splitCoreInfo.bN2Start;
+        ldInfo.ldSlotGS1[ldInfo.ldSlotCount] = splitCoreInfo.gS1Start;
+        ldInfo.ldSlot[ldInfo.ldSlotCount] = slot0 + (cubeCoreIdx - firstCore0);
+        ldInfo.ldSlotCount++;
+    }
+    if (!isSingleRow && splitCoreInfo.s2End < w1 - 1) {
+        ldInfo.ldSlotBN2[ldInfo.ldSlotCount] = splitCoreInfo.bN2End;
+        ldInfo.ldSlotGS1[ldInfo.ldSlotCount] = splitCoreInfo.gS1End;
+        ldInfo.ldSlot[ldInfo.ldSlotCount] = slot1 + (cubeCoreIdx - firstCore1);
+        ldInfo.ldSlotCount++;
+    }
+
     if ASCEND_IS_AIV {
-        ldInfo.isLdCoreEnable = false;
+        // ===== SplitFD：把 fd 归约任务负载均衡分给 48 个 AIV =====
+        if (fdCount == 0) {
+            ldInfo.isLdCoreEnable = false;
+            return;
+        }
+        uint64_t totalFDLoad = 0;
+        for (uint32_t i = 0; i < fdCount; i++) {
+            totalFDLoad += (uint64_t)fdSplitNum[i] * fdMSize[i];
+        }
+        uint64_t averageLoad = (totalFDLoad + AIV_CORE_NUM - 1) / AIV_CORE_NUM;
+        uint32_t fdIdx[AIV_CORE_NUM], fdMStart[AIV_CORE_NUM], fdMNum[AIV_CORE_NUM];
+        uint32_t curCoreIndex = 0;
+        for (uint32_t i = 0; i < fdCount; i++) {
+            uint32_t curFDVectorNum = (uint32_t)((uint64_t)fdSplitNum[i] * fdMSize[i] / averageLoad);
+            curFDVectorNum = Max(1U, curFDVectorNum);
+            uint32_t curAveMSize = (fdMSize[i] + curFDVectorNum - 1) / curFDVectorNum;
+            curFDVectorNum = (fdMSize[i] + curAveMSize - 1) / curAveMSize;
+            for (uint32_t vid = 0; vid < curFDVectorNum; vid++) {
+                if (curCoreIndex >= AIV_CORE_NUM) {
+                    break;
+                }
+                fdIdx[curCoreIndex] = i;
+                fdMStart[curCoreIndex] = vid * curAveMSize;
+                fdMNum[curCoreIndex] =
+                    (vid < curFDVectorNum - 1) ? curAveMSize : fdMSize[i] - vid * curAveMSize;
+                curCoreIndex++;
+            }
+        }
+        if (vecCoreIdx >= curCoreIndex) {
+            ldInfo.isLdCoreEnable = false;
+            return;
+        }
+        uint32_t fi = fdIdx[vecCoreIdx];
+        ldInfo.isLdCoreEnable = true;
+        ldInfo.bn2Idx = fdBN2[fi];
+        ldInfo.bIdx = ldInfo.bn2Idx / constInfo.kHeadNum;
+        ldInfo.n2Idx = ldInfo.bn2Idx % constInfo.kHeadNum;
+        ldInfo.mIdx = fdM[fi];
+        ldInfo.workspaceIdx = fdW[fi];
+        ldInfo.workspaceNum = fdSplitNum[fi];
+        ldInfo.mStart = fdMStart[vecCoreIdx];
+        ldInfo.mNum = fdMNum[vecCoreIdx];
+        uint64_t actualSeqQPrefixSum = 0;
+        if constexpr (Q_LAYOUT_T == LI_LAYOUT::TND) {
+            uint32_t actualSeqLengthsGmQIdx = (constInfo.batchSupperFlag) ? ldInfo.bIdx : ldInfo.bIdx - 1;
+            actualSeqQPrefixSum = (ldInfo.bIdx <= 0) ? 0 : actualSeqLengthsGmQ.GetValue(actualSeqLengthsGmQIdx);
+        } else {  // BSND
+            actualSeqQPrefixSum = (ldInfo.bIdx <= 0) ? 0 : (uint64_t)ldInfo.bIdx * constInfo.qSeqSize;
+        }
+        ldInfo.indiceOutCoreOffset = actualSeqQPrefixSum * constInfo.kHeadNum * constInfo.sparseCount +
+                                     ldInfo.n2Idx * constInfo.sparseCount +
+                                     ldInfo.mIdx * constInfo.s1BaseSize * constInfo.kHeadNum * constInfo.sparseCount;
     }
 }
 
@@ -808,9 +712,16 @@ __aicore__ inline void QLIPreload<QLIT>::CalcRunInfo(uint32_t loop, uint32_t s2L
     runInfo.bN2Idx = tempLoopInfo.bN2Idx;
     runInfo.isValid = s2LoopIdx <= tempLoopInfo.s2LoopEnd;
     runInfo.isNeedLD = tempLoopInfo.isNeedLD;
+    // 块池切分下本核可能跨多行（至多 2 个部分行），部分行的 LD slot 按 (bN2,gS1) 查
+    // ldInfo.ldSlot* 得到（被切分行的 slot 按行主序连续），不能再用逐行递增。
     if (runInfo.isNeedLD && s2LoopIdx == tempLoopInfo.s2LoopEnd) {
-        runInfo.saveWorkSpaceIdx = ldInfo.saveWorkSpaceIdx;
-        ldInfo.saveWorkSpaceIdx++;
+        runInfo.saveWorkSpaceIdx = 0;
+        for (uint32_t i = 0; i < ldInfo.ldSlotCount; i++) {
+            if (ldInfo.ldSlotBN2[i] == tempLoopInfo.bN2Idx && ldInfo.ldSlotGS1[i] == tempLoopInfo.gS1Idx) {
+                runInfo.saveWorkSpaceIdx = ldInfo.ldSlot[i];
+                break;
+            }
+        }
     }
 
     if (!runInfo.isValid) {
