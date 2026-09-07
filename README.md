@@ -1,5 +1,5 @@
 
-本仓库提供 A5 下 quant_lightning_indexer_c8算子，为解决原qli算子小batch下线性度不足的问题。
+本仓库提供 A5 下 quant_lightning_indexer_c8与fused_li_manage_mtp_c8算子，为解决原qli算子小batch下线性度不足的问题。
 
 其中ops-transfomer下的cann官方实验性算子，编译与测试参考文件夹内的md文件，该算子被拆分为了2个算子来完成，并且不支持heads = 32。
 
@@ -40,7 +40,7 @@ export NANOVLLM_CUST_OPAPI_LIB=$PWD/_custom_opp_bf16/vendors/customize/op_api/li
 ```bash
 python tests/test_quant_lightning_indexer_c8.py --device npu:0 --batch-size 1,4,8,16,32,48,64 --source-lens 65536,131072 --heads 32 --warmup 10 --iters 300
 ```
-## 当前测试情况
+## 当前测试情况(qli算子)
 
 | SeqLen | batch | official_c8(us) | fused_li(us) | speedup |
 | -------- | ------- | ------------------ | --------------- | --------- |
@@ -58,3 +58,16 @@ python tests/test_quant_lightning_indexer_c8.py --device npu:0 --batch-size 1,4,
 | 128K   | 32    | 325.538          | 232.835       | 1.398   |
 | 128K   | 48    | 341.316          | 338.038       | 1.010   |
 | 128K   | 64    | 497.184          | 453.943       | 1.095   |
+
+
+## 当前测试情况(qlim+mtp算子)
+
+| batch | official_c8_li_mtp_avg_us(μs) | lim_mtp_c8_avg_us(μs) | delta(μs) | speedup(official / lim) |
+| ------- | ------------------------------------- | ---------------------------- | ------------ | ------------------------- |
+| 1     | 148.663                             | 111.486                    | -37.177    | 1.333                   |
+| 4     | 149.359                             | 131.089                    | -18.270    | 1.140                   |
+| 8     | 161.259                             | 165.093                    | +3.834     | 0.977                   |
+| 16    | 174.330                             | 248.069                    | +73.739    | 0.703                   |
+| 24    | 197.509                             | 283.075                    | +85.566    | 0.698                   |
+| 32    | 385.769                             | 556.278                    | +170.509   | 0.693                   |
+
