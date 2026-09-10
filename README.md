@@ -3,12 +3,14 @@
 
 其中ops-transfomer下的cann官方实验性算子，编译与测试参考文件夹内的md文件，该算子被拆分为了2个算子来完成，并且不支持heads = 32。
 
-csrc下的quant_lightning_indexer_c8为当前实现的算子，实现了单算子逻辑与对heads = 32的支持。
+nanovllm-DSA-offload-ops-a5下的quant_lightning_indexer_c8为当前实现的算子，实现了单算子逻辑与对heads = 32的支持。
 
 
 
 ## 编译
 
+
+cd {path_to nanovllm-DSA-offload-ops_a5}/nanovllm-DSA-offload-ops_a5
 ```bash
 unset ASCEND_CUSTOM_OPP_PATH
 unset NANOVLLM_A5_INSTALL_OPP_PATH
