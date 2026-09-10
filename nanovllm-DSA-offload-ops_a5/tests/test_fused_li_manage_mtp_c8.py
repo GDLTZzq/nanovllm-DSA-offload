@@ -1,0 +1,1600 @@
+#!/usr/bin/env python3
+"""Behavior and latency test for one-kernel A5 C8 MTP LI management."""
+
+from __future__ import annotations
+
+import argparse
+import statistics
+from collections.abc import Callable
+from dataclasses import dataclass, replace
+
+import torch
+import nanovllm_dsa_a5
+
+from _c8_lidu_case import (
+    normalized_hadamard_128,
+    official_c8_lightning_indexer,
+    quantize_fp8,
+)
+from _lidu_utils import (
+    MAX_CACHE_TOKENS,
+    MAX_SOURCE_CAPACITY,
+    TOPK,
+    assert_pool_row,
+    assert_request_pool_entries,
+)
+from _utils import csv_ints, require_a5
+
+
+BLOCK_SIZE = 128
+UNION_CAPACITY = 8192
+QUERY_COUNT = 4
+OUTPUT_POISON = -123456789
+POOL_GUARD = -777777777
+
+
+@dataclass
+class MtpC8Case:
+    query: torch.Tensor
+    key: torch.Tensor
+    weights: torch.Tensor
+    query_scale: torch.Tensor
+    key_scale: torch.Tensor
+    actual_q: torch.Tensor
+    actual_q_cpu: list[int]
+    req_entries: torch.Tensor
+    req_entries_cpu: torch.Tensor
+    initial_pool: torch.Tensor
+    cache_tokens: torch.Tensor
+    candidate_lens: torch.Tensor
+    block_table: torch.Tensor
+    native_topk: torch.Tensor
+    target_union_misses: list[int]
+    target_per_query_misses: list[list[int]]
+    source_capacity: int
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--device", default="npu:0")
+    parser.add_argument("--batch-size", type=int, default=6)
+    parser.add_argument("--heads", type=csv_ints, default=csv_ints("32,64"))
+    parser.add_argument("--source-len", type=int, default=20096)
+    parser.add_argument(
+        "--cache-tokens",
+        type=int,
+        default=12288,
+        help="shared MTP3 cache budget; use --first-request-c0 for a mixed batch",
+    )
+    parser.add_argument(
+        "--first-request-c0",
+        action="store_true",
+        help="make the first performance-case request a C=0 no-op",
+    )
+    parser.add_argument("--per-query-miss-count", type=int, default=100)
+    parser.add_argument("--union-miss-count", type=int, default=300)
+    parser.add_argument("--query-noise", type=float, default=0.25)
+    parser.add_argument("--pool-extra", type=int, default=7)
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--iters", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--allow-non-a5", action="store_true")
+    parser.add_argument(
+        "--only-mixed",
+        action="store_true",
+        help="BISECT: run only check_mixed_long_sequence_lengths",
+    )
+    return parser.parse_args()
+
+
+def check_args(args: argparse.Namespace) -> None:
+    if args.batch_size <= 0:
+        raise ValueError("batch-size must be positive")
+    if any(heads not in (32, 64) for heads in args.heads):
+        raise ValueError("C8 index heads must be 32 or 64")
+    if args.source_len <= 0 or args.source_len % BLOCK_SIZE:
+        raise ValueError("source-len must be a positive multiple of 128")
+    if args.source_len > MAX_SOURCE_CAPACITY:
+        raise ValueError("source-len exceeds the 18-bit token-ID capacity")
+    if args.cache_tokens != 0 and (
+        args.cache_tokens < UNION_CAPACITY
+        or args.cache_tokens > MAX_CACHE_TOKENS
+        or args.cache_tokens % BLOCK_SIZE
+    ):
+        raise ValueError(
+            "MTP3 cache-tokens must be 0 or block-aligned in [8192,16256]"
+        )
+    if args.cache_tokens > args.source_len:
+        raise ValueError("cache-tokens must not exceed source-len")
+    if not 0 <= args.per_query_miss_count <= TOPK:
+        raise ValueError("per-query-miss-count must be in [0,2048]")
+    minimum_union = args.per_query_miss_count
+    maximum_union = QUERY_COUNT * args.per_query_miss_count
+    if not minimum_union <= args.union_miss_count <= maximum_union:
+        raise ValueError(
+            "union-miss-count must be in [M,4M] for M=per-query-miss-count"
+        )
+    if args.union_miss_count > UNION_CAPACITY:
+        raise ValueError("union-miss-count must not exceed 8192")
+    if args.query_noise <= 0:
+        raise ValueError("query-noise must be positive")
+    if args.source_len < UNION_CAPACITY + args.union_miss_count:
+        raise ValueError(
+            "source-len must be >= 8192 + union-miss-count"
+        )
+    if args.pool_extra < 0:
+        raise ValueError("pool-extra must be non-negative")
+    if args.warmup < 0 or args.iters <= 0:
+        raise ValueError("warmup must be non-negative and iters positive")
+
+
+def query_ranges(actual_q: list[int]) -> list[tuple[int, int]]:
+    return [(end - QUERY_COUNT, end) for end in actual_q]
+
+
+def ordered_union(rows: torch.Tensor) -> list[int]:
+    seen: set[int] = set()
+    result: list[int] = []
+    for token in rows.reshape(-1).tolist():
+        token = int(token)
+        if token >= 0 and token not in seen:
+            seen.add(token)
+            result.append(token)
+    return result
+
+
+def random_prefix(
+    values: torch.Tensor, count: int, generator: torch.Generator
+) -> torch.Tensor:
+    if count == 0:
+        return values[:0]
+    if count < 0 or count > values.numel():
+        raise AssertionError(
+            f"cannot select {count} values from capacity {values.numel()}"
+        )
+    return values[torch.randperm(values.numel(), generator=generator)[:count]]
+
+
+def build_balanced_pool(
+    topk: torch.Tensor,
+    *,
+    batch: int,
+    source_len: int,
+    budgets: list[int],
+    candidate_lens: list[int],
+    req_entries_cpu: torch.Tensor,
+    per_query_misses: int,
+    union_misses: int,
+    pool_extra: int,
+    generator: torch.Generator,
+) -> tuple[torch.Tensor, list[int], list[list[int]]]:
+    """Build exact M misses per route and U unique misses per request."""
+
+    # Distinct guard rows expose accidental cross-request clears as well as
+    # writes. Every active row is then initialized to the real empty value -1.
+    pool = torch.full(
+        (batch + pool_extra, source_len), POOL_GUARD, dtype=torch.int32
+    )
+    union_counts: list[int] = []
+    route_counts: list[list[int]] = []
+    for request in range(batch):
+        budget = budgets[request]
+        pool_row = int(req_entries_cpu[request])
+        pool[pool_row].fill_(-1)
+        if budget == 0:
+            union_counts.append(0)
+            route_counts.append([0] * QUERY_COUNT)
+            continue
+        all_sources = torch.arange(
+            candidate_lens[request], dtype=torch.int64
+        )
+        rows = topk[
+            request * QUERY_COUNT : (request + 1) * QUERY_COUNT
+        ].to(torch.int64)
+        union = torch.tensor(
+            ordered_union(rows), dtype=torch.int64
+        )
+        if union.numel() > budget:
+            raise AssertionError(
+                f"request={request}: TopK union={union.numel()} exceeds C={budget}; "
+                "reduce --query-noise or increase C"
+            )
+
+        membership = torch.zeros(source_len, dtype=torch.uint8)
+        for route, row in enumerate(rows):
+            membership[row] |= 1 << route
+        by_mask = {
+            mask: torch.nonzero(membership == mask).flatten().to(torch.int64)
+            for mask in range(1, 1 << QUERY_COUNT)
+        }
+        opposite_pairs = (
+            (0b0011, 0b1100),
+            (0b0101, 0b1010),
+            (0b1001, 0b0110),
+        )
+        selected_counts = {mask: 0 for mask in range(1, 1 << QUERY_COUNT)}
+
+        def allocate_pair_units(pair_units: int) -> list[int] | None:
+            capacities = [
+                min(
+                    int(by_mask[left].numel()) - selected_counts[left],
+                    int(by_mask[right].numel()) - selected_counts[right],
+                )
+                for left, right in opposite_pairs
+            ]
+            if sum(capacities) < pair_units:
+                return None
+            counts = [
+                min(pair_units // len(opposite_pairs), capacity)
+                for capacity in capacities
+            ]
+            remaining = pair_units - sum(counts)
+            while remaining:
+                progressed = False
+                for index, capacity in enumerate(capacities):
+                    if counts[index] < capacity:
+                        counts[index] += 1
+                        remaining -= 1
+                        progressed = True
+                        if remaining == 0:
+                            break
+                if not progressed:
+                    return None
+            return counts
+
+        if union_misses <= 2 * per_query_misses:
+            common_count = 2 * per_query_misses - union_misses
+            pair_units = union_misses - per_query_misses
+            if common_count > int(by_mask[0b1111].numel()):
+                raise AssertionError(
+                    f"request={request}: insufficient four-route overlap; "
+                    "adjust --query-noise"
+                )
+            selected_counts[0b1111] = common_count
+            pair_counts = allocate_pair_units(pair_units)
+        else:
+            degree2_tokens = 4 * per_query_misses - union_misses
+            pair_units = degree2_tokens // 2
+            needs_extra = degree2_tokens % 2
+            pair_masks = tuple(mask for pair in opposite_pairs for mask in pair)
+            pair_counts = None
+            candidates: tuple[int | None, ...] = (
+                pair_masks if needs_extra else (None,)
+            )
+            for extra_mask in candidates:
+                if extra_mask is not None:
+                    if by_mask[extra_mask].numel() == 0:
+                        continue
+                    selected_counts[extra_mask] = 1
+                route_degrees = [pair_units] * QUERY_COUNT
+                if extra_mask is not None:
+                    for route in range(QUERY_COUNT):
+                        route_degrees[route] += (extra_mask >> route) & 1
+                singleton_needs = [
+                    per_query_misses - degree for degree in route_degrees
+                ]
+                singleton_fit = all(
+                    0 <= need <= int(by_mask[1 << route].numel())
+                    for route, need in enumerate(singleton_needs)
+                )
+                candidate_counts = (
+                    allocate_pair_units(pair_units) if singleton_fit else None
+                )
+                if candidate_counts is not None:
+                    pair_counts = candidate_counts
+                    break
+                if extra_mask is not None:
+                    selected_counts[extra_mask] = 0
+
+        if pair_counts is None:
+            raise AssertionError(
+                f"request={request}: membership buckets cannot construct exact "
+                "M/U; adjust --query-noise"
+            )
+        for (left, right), count in zip(opposite_pairs, pair_counts):
+            selected_counts[left] += count
+            selected_counts[right] += count
+
+        if union_misses > 2 * per_query_misses:
+            route_degrees = [0] * QUERY_COUNT
+            for mask, count in selected_counts.items():
+                for route in range(QUERY_COUNT):
+                    if mask & (1 << route):
+                        route_degrees[route] += count
+            for route, degree in enumerate(route_degrees):
+                singleton_count = per_query_misses - degree
+                if singleton_count > int(by_mask[1 << route].numel()):
+                    raise AssertionError(
+                        f"request={request}: insufficient route-{route} singleton "
+                        "capacity; adjust --query-noise"
+                    )
+                selected_counts[1 << route] += singleton_count
+
+        selected = [
+            random_prefix(by_mask[mask], count, generator)
+            for mask, count in selected_counts.items()
+            if count
+        ]
+        misses = (
+            torch.cat(selected)
+            if selected
+            else torch.empty(0, dtype=torch.int64)
+        )
+        per_route = [int(torch.isin(misses, row).sum()) for row in rows]
+        if (
+            torch.unique(misses).numel() != union_misses
+            or per_route != [per_query_misses] * QUERY_COUNT
+        ):
+            raise AssertionError(
+                f"request={request}: exact M/U construction failed: "
+                f"per_route={per_route}, union={torch.unique(misses).numel()}"
+            )
+
+        missing_mask = torch.zeros(source_len, dtype=torch.bool)
+        missing_mask[misses] = True
+        hits = union[~missing_mask[union]]
+        union_mask = torch.zeros(candidate_lens[request], dtype=torch.bool)
+        union_mask[union] = True
+        fillers = all_sources[~union_mask]
+        cached = torch.cat(
+            (hits, random_prefix(fillers, budget - hits.numel(), generator))
+        )
+        if cached.numel() != budget or torch.unique(cached).numel() != budget:
+            raise AssertionError("cache row must contain exactly C unique tokens")
+        pool[pool_row, cached] = torch.randperm(
+            budget, generator=generator, dtype=torch.int64
+        ).to(torch.int32)
+        union_counts.append(union_misses)
+        route_counts.append(per_route)
+
+    return pool, union_counts, route_counts
+
+
+def make_case(
+    *,
+    device: torch.device,
+    batch: int,
+    heads: int,
+    source_len: int,
+    budgets: list[int],
+    per_query_misses: int,
+    union_misses: int,
+    query_noise: float,
+    pool_extra: int,
+    seed: int,
+    candidate_lens_cpu: list[int] | None = None,
+) -> MtpC8Case:
+    if len(budgets) != batch:
+        raise ValueError("budget list must match batch")
+    if candidate_lens_cpu is None:
+        candidate_lens_cpu = [source_len] * batch
+    if len(candidate_lens_cpu) != batch:
+        raise ValueError("candidate-length list must match batch")
+    if any(
+        length < TOPK or length > source_len or length % BLOCK_SIZE
+        for length in candidate_lens_cpu
+    ):
+        raise ValueError(
+            "candidate lengths must be block-aligned values in "
+            "[2048,source_len]"
+        )
+    if any(
+        budget != 0
+        and (
+            budget < UNION_CAPACITY
+            or budget > MAX_CACHE_TOKENS
+            or budget % BLOCK_SIZE
+        )
+        for budget in budgets
+    ):
+        raise ValueError(
+            "MTP3 budgets must be 0 or block-aligned in [8192,16256]"
+        )
+    for request, budget in enumerate(budgets):
+        if budget != 0 and budget < UNION_CAPACITY:
+            raise ValueError(
+                f"request {request}: MTP3 requires C>=8192, got C={budget}"
+            )
+    torch.manual_seed(seed)
+    torch.npu.manual_seed_all(seed)
+    generator = torch.Generator().manual_seed(seed + 1)
+    packed_queries = batch * QUERY_COUNT
+    actual_q_cpu = [QUERY_COUNT * (row + 1) for row in range(batch)]
+
+    blocks_per_request = source_len // BLOCK_SIZE
+    total_blocks = batch * blocks_per_request
+    # Match the standalone official-LI benchmark and real multi-request KV
+    # allocation: every request owns a disjoint set of physical blocks.  A
+    # single global permutation keeps addresses random without introducing
+    # cross-request L2 reuse of the same index-key storage.
+    block_table_cpu = torch.randperm(
+        total_blocks, generator=generator
+    ).reshape(batch, blocks_per_request).to(torch.int32)
+    base_query = torch.randn(
+        (batch, 1, heads, 128), generator=generator, dtype=torch.bfloat16
+    )
+    route_noise = torch.randn(
+        (batch, QUERY_COUNT, heads, 128),
+        generator=generator,
+        dtype=torch.bfloat16,
+    )
+    query_fp = (
+        base_query + query_noise * route_noise
+    ).reshape(packed_queries, heads, 128).to(device)
+    key_fp = torch.empty(
+        (total_blocks, BLOCK_SIZE, 1, 128),
+        dtype=torch.bfloat16,
+        device=device,
+    ).uniform_(-1, 1)
+    hadamard = normalized_hadamard_128(
+        dtype=torch.bfloat16, device=device
+    )
+    query, query_scale = quantize_fp8(torch.matmul(query_fp, hadamard))
+    key, key_scale = quantize_fp8(torch.matmul(key_fp, hadamard))
+    base_weights = torch.rand(
+        (batch, 1, heads), generator=generator, dtype=torch.bfloat16
+    )
+    weights = (
+        base_weights.expand(-1, QUERY_COUNT, -1)
+        .reshape(packed_queries, heads)
+        .contiguous()
+        .to(device)
+    )
+    actual_q = torch.tensor(
+        actual_q_cpu, dtype=torch.int32, device=device
+    )
+    candidate_lens = torch.tensor(
+        candidate_lens_cpu, dtype=torch.int32, device=device
+    )
+    block_table = block_table_cpu.to(device)
+    native_topk = official_c8_lightning_indexer(
+        query,
+        key,
+        weights,
+        query_scale,
+        key_scale,
+        actual_q,
+        candidate_lens,
+        block_table,
+    ).reshape(packed_queries, TOPK)
+    torch.npu.synchronize()
+    native_cpu = native_topk.cpu()
+
+    req_entries_cpu = torch.randperm(
+        batch + pool_extra, generator=generator
+    )[:batch].to(torch.int32)
+    for request, (budget, candidate_len) in enumerate(
+        zip(budgets, candidate_lens_cpu)
+    ):
+        if budget > candidate_len:
+            raise ValueError(
+                f"request {request}: C={budget} exceeds candidate_len={candidate_len}"
+            )
+    pool, target_union_misses, target_per_query_misses = build_balanced_pool(
+        native_cpu,
+        batch=batch,
+        source_len=source_len,
+        budgets=budgets,
+        candidate_lens=candidate_lens_cpu,
+        req_entries_cpu=req_entries_cpu,
+        per_query_misses=per_query_misses,
+        union_misses=union_misses,
+        pool_extra=pool_extra,
+        generator=generator,
+    )
+
+    return MtpC8Case(
+        query=query,
+        key=key,
+        weights=weights,
+        query_scale=query_scale,
+        key_scale=key_scale,
+        actual_q=actual_q,
+        actual_q_cpu=actual_q_cpu,
+        req_entries=req_entries_cpu.to(device),
+        req_entries_cpu=req_entries_cpu,
+        initial_pool=pool.to(device),
+        cache_tokens=torch.tensor(
+            budgets, dtype=torch.int32, device=device
+        ),
+        candidate_lens=candidate_lens,
+        block_table=block_table,
+        native_topk=native_topk,
+        target_union_misses=target_union_misses,
+        target_per_query_misses=target_per_query_misses,
+        source_capacity=source_len,
+    )
+
+
+def output_buffers(
+    case: MtpC8Case,
+) -> tuple[torch.Tensor, ...]:
+    options = {"dtype": torch.int32, "device": case.query.device}
+    topk_sources = torch.full(
+        (case.query.size(0), 1, TOPK), OUTPUT_POISON, **options
+    )
+    topk_slots = torch.full(
+        (case.query.size(0), 1, TOPK), OUTPUT_POISON, **options
+    )
+    topk_miss_count = torch.full(
+        (case.query.size(0),), OUTPUT_POISON, **options
+    )
+    copy_sources = torch.full(
+        (len(case.actual_q_cpu), UNION_CAPACITY), OUTPUT_POISON, **options
+    )
+    copy_slots = torch.full_like(copy_sources, OUTPUT_POISON)
+    copy_counts = torch.full(
+        (len(case.actual_q_cpu),), OUTPUT_POISON, **options
+    )
+    return (
+        topk_sources,
+        topk_slots,
+        topk_miss_count,
+        copy_sources,
+        copy_slots,
+        copy_counts,
+    )
+
+
+def launch(
+    case: MtpC8Case,
+    pool: torch.Tensor,
+    outputs: tuple[torch.Tensor, ...] | None = None,
+) -> tuple[torch.Tensor, ...]:
+    if outputs is None:
+        outputs = output_buffers(case)
+    (
+        topk_sources,
+        topk_slots,
+        topk_miss_count,
+        copy_sources,
+        copy_slots,
+        copy_counts,
+    ) = outputs
+    result = torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8.default(
+        case.query,
+        case.weights,
+        case.key,
+        case.query_scale,
+        case.key_scale,
+        case.actual_q,
+        case.block_table,
+        case.candidate_lens,
+        case.cache_tokens,
+        case.req_entries,
+        pool,
+        topk_sources,
+        topk_slots,
+        topk_miss_count,
+        copy_sources,
+        copy_slots,
+        copy_counts,
+    )
+    if result is not None:
+        raise AssertionError("C8 MTP LIM caller-owned API must return None")
+    return outputs
+
+
+def event_us(
+    runner: Callable[[], object],
+    *,
+    warmup: int,
+    iters: int,
+    setup: Callable[[], object] | None = None,
+) -> float:
+    # Do not synchronize every sample.  With an empty stream, the start event
+    # can execute before Python/ACLNN has finished dispatching the operator;
+    # the resulting device-idle launch gap is then incorrectly charged to the
+    # operator.  Queue warmups and all timed samples first so the stream stays
+    # fed, then synchronize once and read the per-sample event intervals.  This
+    # is the steady decode / graph-replay timing contract used by this test.
+    event_pairs = [
+        (
+            torch.npu.Event(enable_timing=True),
+            torch.npu.Event(enable_timing=True),
+        )
+        for _ in range(iters)
+    ]
+    for _ in range(warmup):
+        if setup is not None:
+            setup()
+        runner()
+
+    for start, end in event_pairs:
+        if setup is not None:
+            setup()
+        start.record()
+        runner()
+        end.record()
+    torch.npu.synchronize()
+
+    samples = [
+        float(start.elapsed_time(end)) * 1000.0
+        for start, end in event_pairs
+    ]
+    return statistics.mean(samples)
+
+
+def benchmark(
+    case: MtpC8Case, warmup: int, iters: int
+) -> tuple[float, float]:
+    pool = case.initial_pool.clone()
+    outputs = output_buffers(case)
+
+    official_mean_us = event_us(
+        lambda: official_c8_lightning_indexer(
+            case.query,
+            case.key,
+            case.weights,
+            case.query_scale,
+            case.key_scale,
+            case.actual_q,
+            case.candidate_lens,
+            case.block_table,
+        ),
+        warmup=warmup,
+        iters=iters,
+    )
+    fused_mean_us = event_us(
+        lambda: launch(case, pool, outputs),
+        warmup=warmup,
+        iters=iters,
+        # setup() is queued before the start event on the same stream, so the
+        # reset is excluded while every sample retains the same miss pattern.
+        setup=lambda: pool.copy_(case.initial_pool),
+    )
+    return official_mean_us, fused_mean_us
+
+
+def per_query_miss_counts(case: MtpC8Case) -> list[int]:
+    pool = case.initial_pool.cpu()
+    topk = case.native_topk.cpu().reshape(case.query.size(0), TOPK)
+    cache_tokens = case.cache_tokens.cpu().tolist()
+    result: list[int] = []
+    for batch_row, (begin, end) in enumerate(query_ranges(case.actual_q_cpu)):
+        if cache_tokens[batch_row] == 0:
+            result.extend([0] * (end - begin))
+            continue
+        pool_row = int(case.req_entries_cpu[batch_row])
+        for query_row in range(begin, end):
+            slots = pool[pool_row, topk[query_row].long()]
+            result.append(int((slots < 0).sum()))
+    return result
+
+
+def validate_case(
+    case: MtpC8Case,
+    old_pool: torch.Tensor,
+    new_pool: torch.Tensor,
+    outputs: tuple[torch.Tensor, ...],
+) -> None:
+    (
+        topk_sources,
+        topk_slots,
+        topk_miss_count,
+        miss_sources,
+        miss_slots,
+        miss_counts,
+    ) = outputs
+    expected_shapes = (
+        (case.query.size(0), 1, TOPK),
+        (case.query.size(0), 1, TOPK),
+        (case.query.size(0),),
+        (len(case.actual_q_cpu), UNION_CAPACITY),
+        (len(case.actual_q_cpu), UNION_CAPACITY),
+        (len(case.actual_q_cpu),),
+    )
+    for tensor, shape in zip(outputs, expected_shapes):
+        if tensor.dtype != torch.int32 or tuple(tensor.shape) != shape:
+            raise AssertionError(
+                f"unexpected C8 MTP output {tensor.dtype}/{tuple(tensor.shape)}"
+            )
+    topk_sources_cpu = topk_sources.reshape(case.query.size(0), TOPK).cpu()
+    topk_slots_cpu = topk_slots.reshape(case.query.size(0), TOPK).cpu()
+    topk_miss_count_cpu = topk_miss_count.cpu()
+    miss_sources_cpu = miss_sources.cpu()
+    miss_slots_cpu = miss_slots.cpu()
+    miss_counts_cpu = miss_counts.cpu()
+    native_cpu = case.native_topk.cpu().reshape(case.query.size(0), TOPK)
+    old_cpu = old_pool.cpu()
+    new_cpu = new_pool.cpu()
+    ranges = query_ranges(case.actual_q_cpu)
+    assert_request_pool_entries(
+        case.req_entries_cpu, len(case.actual_q_cpu), new_cpu.size(0)
+    )
+    active_rows = set(case.req_entries_cpu.tolist())
+    for pool_row in range(new_cpu.size(0)):
+        if pool_row not in active_rows and not torch.equal(
+            old_cpu[pool_row], new_cpu[pool_row]
+        ):
+            raise AssertionError(f"inactive request-pool row {pool_row} changed")
+
+    for batch_row, (begin, end) in enumerate(ranges):
+        pool_row = int(case.req_entries_cpu[batch_row])
+        budget = int(case.cache_tokens[batch_row].cpu())
+        candidate_len = int(case.candidate_lens[batch_row].cpu())
+        # ---- HOST DIAG (printf-free): localize cache-cardinality loss ----
+        _diag_valid = int((new_cpu[pool_row][:candidate_len] >= 0).sum())
+        if _diag_valid != budget:
+            _oldr = old_cpu[pool_row]
+            _count_raw = int(miss_counts_cpu[batch_row])
+            _count = _count_raw if 0 <= _count_raw <= UNION_CAPACITY else 0
+            _tok = miss_sources_cpu[batch_row, :_count]
+            _slt = miss_slots_cpu[batch_row, :_count]
+            _t_ok = (_tok >= 0) & (_tok < _oldr.numel())
+            if _count == 0:
+                _resident = 0
+            else:
+                _resident = int(
+                    (_t_ok & (_oldr[_tok.clamp(0, _oldr.numel() - 1)] >= 0)
+                     ).sum()
+                )
+            _dup_t = _count - int(torch.unique(_tok).numel())
+            _s_ok = (_slt >= 0) & (_slt < _oldr.numel())
+            _dup_s = int(_s_ok.sum()) - int(torch.unique(_slt[_s_ok]).numel())
+            _tokl = [int(t) for t in _tok.tolist()]
+            _sltl = [int(s) for s in _slt.tolist()]
+            _dup_tok_sample = sorted(
+                {t for t in set(_tokl) if _tokl.count(t) > 1}
+            )[:12]
+            _dup_slt_sample = [
+                s for s in set(_sltl) if _sltl.count(s) > 1
+            ][:12]
+            _uni = sorted(ordered_union(native_cpu[begin:end]))
+            _exp = {
+                int(t)
+                for t in _uni
+                if int(old_cpu[pool_row, int(t)]) < 0
+            }
+            _got = {
+                int(t)
+                for t in _tokl
+                if 0 <= int(t) < _oldr.numel()
+            }
+            _bad = sorted(
+                int(t) for t in _got if int(old_cpu[pool_row, int(t)]) >= 0
+            )
+            _extra = sorted(_got - _exp)
+            print(f"[DIAG] row={pool_row} budget={budget} valid={_diag_valid} "
+                  f"loss={budget - _diag_valid}", flush=True)
+            print(f"[DIAG] miss_count_raw={_count_raw} applied_n={_count} "
+                  f"dup_token={_dup_t} dup_slot={_dup_s} "
+                  f"already_resident={_resident}", flush=True)
+            print(f"[DIAG] dup_token_sample={_dup_tok_sample} "
+                  f"dup_slot_sample={_dup_slt_sample}", flush=True)
+            print(f"[DIAG] union_exp={len(_exp)} union_got={len(_got)} "
+                  f"got_missing={len(_exp - _got)} "
+                  f"got_extra={len(_got - _exp)}", flush=True)
+            print(f"[DIAG] emitted_already_resident n={len(_bad)} "
+                  f"sample={_bad[:24]}", flush=True)
+            print(f"[DIAG] emitted_outside_host_union n={len(_extra)} "
+                  f"sample={_extra[:24]}", flush=True)
+        for _r in range(begin, end):
+            _oldr = old_cpu[pool_row]
+            _sel = native_cpu[_r].long()
+            _osl = old_cpu[pool_row].gather(0, _sel)
+            _emc = int((_osl < 0).sum())
+            _esrc = sorted(int(s) for s in _sel[_osl < 0].tolist())
+            _nfull = sorted(int(s) for s in native_cpu[_r].tolist())
+            _ptot_all = topk_sources_cpu[_r].tolist()
+            _pfull = sorted(_ptot_all)
+            _full_ok = _pfull == _nfull
+            _pnative_missing = len(set(_nfull) - set(_pfull))
+            _pextra = len(set(_pfull) - set(_nfull))
+            _pmc = int(topk_miss_count_cpu[_r])
+            _pmc_ok = 0 <= _pmc <= TOPK
+            _pres = -1
+            _pset_ok = None
+            _phit_res = -1
+            if _pmc_ok:
+                _psrc = topk_sources_cpu[_r][:_pmc]
+                _pmask = (_psrc >= 0) & (_psrc < _oldr.numel())
+                _pres = int(
+                    (_pmask & (_oldr[_psrc.clamp(0, _oldr.numel() - 1)] >= 0)
+                     ).sum()
+                )
+                _pset = sorted(int(s) for s in _psrc[_pmask].tolist())
+                _pset_ok = _pset == _esrc
+                _phit = _ptot_all[_pmc:]
+                _phit_res = sum(
+                    1 for s in _phit
+                    if 0 <= s < _oldr.numel() and int(_oldr[int(s)]) >= 0
+                )
+            # 全集判别：classify 发布集=miss+hit 全集=payload token 集。
+            # full_set_ok=True → payload==native top-2048（winners 对，分类/计数错）；
+            # False → LD 归并 winner 本身就是错源。
+            if (_diag_valid != budget) or (not _full_ok) or (_pset_ok is False):
+                print(f"[DIAG] req={batch_row} prow={pool_row} q{_r} pub_mc={_pmc} exp_mc={_emc} "
+                      f"pub_resident_in_miss={_pres} "
+                      f"pub_miss_set_ok={_pset_ok} "
+                      f"full_set_ok={_full_ok} "
+                      f"hit_tail_resident={_phit_res} "
+                      f"native_missing_from_pub={_pnative_missing} "
+                      f"pub_extra={_pextra}", flush=True)
+        assert_pool_row(old_cpu[pool_row], candidate_len, budget)
+        assert_pool_row(new_cpu[pool_row], candidate_len, budget)
+        count = int(miss_counts_cpu[batch_row])
+        if budget == 0:
+            if (
+                count != 0
+                or bool((topk_sources_cpu[begin:end] != -1).any())
+                or bool((topk_slots_cpu[begin:end] != -1).any())
+                or bool((topk_miss_count_cpu[begin:end] != 0).any())
+                or bool(
+                    (miss_sources_cpu[batch_row] != OUTPUT_POISON).any()
+                )
+                or bool((miss_slots_cpu[batch_row] != OUTPUT_POISON).any())
+            ):
+                raise AssertionError("C=0 MTP request is not a strict no-op")
+            if not torch.equal(old_cpu[pool_row], new_cpu[pool_row]):
+                raise AssertionError("C=0 MTP request changed cache state")
+            continue
+
+        for local_query, row in enumerate(range(begin, end)):
+            selected = native_cpu[row].long()
+            if (
+                int(selected.min()) < 0
+                or int(selected.max()) >= candidate_len
+                or torch.unique(selected).numel() != TOPK
+            ):
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "top-K is outside the prefill-full-block source"
+                )
+            old_slots = old_cpu[pool_row].gather(0, selected)
+            expected_slots = new_cpu[pool_row].gather(0, selected)
+            published_slots = topk_slots_cpu[row]
+            published_sources = topk_sources_cpu[row]
+            old_miss_mask = old_slots < 0
+            sorted_miss_sources = torch.sort(
+                selected[old_miss_mask]
+            ).values
+            miss_count = int(sorted_miss_sources.numel())
+            expected_sources = torch.cat(
+                (sorted_miss_sources, selected[~old_miss_mask])
+            )
+            if not torch.equal(published_sources.long(), expected_sources):
+                pub_set_ok = torch.equal(
+                    torch.sort(published_sources).values.long(),
+                    torch.sort(expected_sources).values.long(),
+                )
+                published_mc = int(topk_miss_count_cpu[row])
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "topk_src_ids is not sorted-miss-prefix + hit-suffix "
+                    f"[set_ok={pub_set_ok} miss_count={miss_count} "
+                    f"pub_miss_count={published_mc} "
+                    f"published[:16]={published_sources[:16].tolist()} "
+                    f"expected[:16]={expected_sources[:16].tolist()} "
+                    f"published[-4:]={published_sources[-4:].tolist()} "
+                    f"expected[-4:]={expected_sources[-4:].tolist()} "
+                    f"old_miss_first={old_slots[:8].tolist()}]"
+                )
+            if int(topk_miss_count_cpu[row]) != miss_count:
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "topk_miss_count does not match the miss prefix "
+                    f"[expected={miss_count} got={int(topk_miss_count_cpu[row])}]"
+                )
+            expected_miss_slots = new_cpu[pool_row].gather(
+                0, sorted_miss_sources
+            )
+            if not torch.equal(
+                published_slots[:miss_count], expected_miss_slots
+            ):
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "sorted miss-prefix destinations mismatch"
+                )
+            if sorted(published_slots[miss_count:].tolist()) != sorted(
+                old_slots[~old_miss_mask].tolist()
+            ):
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "old hit slots were not preserved"
+                )
+            if not torch.equal(
+                torch.sort(published_slots).values,
+                torch.sort(expected_slots).values,
+            ):
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "published slot set differs from official Top-K"
+                )
+            if bool((expected_slots < 0).any()):
+                raise AssertionError("updated cache does not contain a query top-K")
+            if not torch.equal(
+                new_cpu[pool_row].gather(0, published_sources.long()),
+                published_slots,
+            ):
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "topk_src_ids/topk_dst_slots are not elementwise aligned"
+                )
+            if (
+                int(published_sources.min()) < 0
+                or int(published_sources.max()) >= candidate_len
+                or torch.unique(published_sources).numel() != TOPK
+                or bool((published_slots >= budget).any())
+                or torch.unique(published_slots).numel() != TOPK
+            ):
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    "published top-K slots are not unique values in [0,C)"
+                )
+            old_query_misses = int(old_miss_mask.sum())
+            expected_query_misses = case.target_per_query_misses[batch_row][
+                local_query
+            ]
+            if old_query_misses != expected_query_misses:
+                raise AssertionError(
+                    f"request {batch_row} query {local_query}: "
+                    f"misses={old_query_misses}, expected={expected_query_misses}"
+                )
+
+        union = set(ordered_union(native_cpu[begin:end]))
+        expected_misses = {
+            token for token in union if int(old_cpu[pool_row, token]) < 0
+        }
+        if (
+            count != case.target_union_misses[batch_row]
+            or count != len(expected_misses)
+        ):
+            raise AssertionError(
+                f"request {batch_row}: miss_count={count}, "
+                f"expected={case.target_union_misses[batch_row]}, "
+                f"recomputed={len(expected_misses)}"
+            )
+        emitted_tokens = miss_sources_cpu[batch_row, :count].long()
+        emitted_slots = miss_slots_cpu[batch_row, :count]
+        if bool(
+            (miss_sources_cpu[batch_row, count:] != OUTPUT_POISON).any()
+        ) or bool((miss_slots_cpu[batch_row, count:] != OUTPUT_POISON).any()):
+            raise AssertionError("union miss output wrote past its valid prefix")
+        if (
+            torch.unique(emitted_tokens).numel() != count
+            or set(emitted_tokens.tolist()) != expected_misses
+        ):
+            raise AssertionError("union miss output is not unique or complete")
+        if count > 1 and not bool(
+            (emitted_tokens[1:] > emitted_tokens[:-1]).all()
+        ):
+            raise AssertionError("union miss output must be strictly sorted")
+        if (
+            bool((emitted_slots < 0).any())
+            or bool((emitted_slots >= budget).any())
+            or torch.unique(emitted_slots).numel() != count
+        ):
+            raise AssertionError("union miss destination slots are invalid")
+
+        old_valid = (old_cpu[pool_row] >= 0).nonzero().flatten()
+        old_owner = torch.empty(budget, dtype=torch.long)
+        old_owner[old_cpu[pool_row, old_valid].long()] = old_valid
+        expected_new_row = old_cpu[pool_row].clone()
+        for token, slot in zip(emitted_tokens.tolist(), emitted_slots.tolist()):
+            if int(new_cpu[pool_row, token]) != slot:
+                raise AssertionError("miss token was not assigned its output slot")
+            victim = int(old_owner[slot])
+            if victim in union or int(new_cpu[pool_row, victim]) != -1:
+                raise AssertionError("MTP manager evicted a protected union token")
+            expected_new_row[victim] = -1
+            expected_new_row[token] = slot
+        for token in union:
+            old_slot = int(old_cpu[pool_row, token])
+            if old_slot >= 0 and int(new_cpu[pool_row, token]) != old_slot:
+                raise AssertionError("an existing union hit changed its slot")
+        if not torch.equal(new_cpu[pool_row], expected_new_row):
+            raise AssertionError(
+                f"request {batch_row}: cache update changed entries other than "
+                "the published miss/victim pairs"
+            )
+
+
+def check_case(case: MtpC8Case) -> None:
+    pool = case.initial_pool.clone()
+    old_pool = pool.clone()
+    outputs = launch(case, pool)
+    torch.npu.synchronize()
+    validate_case(case, old_pool, pool, outputs)
+
+    # A fresh execution from the identical state must be bitwise stable. This
+    # catches cross-request races and non-deterministic victim ownership that
+    # set-based validation alone cannot detect.
+    deterministic_pool = case.initial_pool.clone()
+    deterministic_outputs = launch(case, deterministic_pool)
+    torch.npu.synchronize()
+    if not torch.equal(pool.cpu(), deterministic_pool.cpu()):
+        raise AssertionError(
+            "identical fresh executions produced different cache states"
+        )
+    for output_index, (first, second) in enumerate(
+        zip(outputs, deterministic_outputs)
+    ):
+        if not torch.equal(first.cpu(), second.cpu()):
+            raise AssertionError(
+                "identical fresh executions produced different output "
+                f"tensor {output_index}"
+            )
+
+    # Run every request alone from the same initial pool. This catches any
+    # accidental dependence on neighboring batch rows or packed-query offsets,
+    # while exercising the same public one-kernel LI + manager implementation.
+    for batch_row, (begin, end) in enumerate(query_ranges(case.actual_q_cpu)):
+        single_pool = case.initial_pool.clone()
+        single_actual_q = torch.tensor(
+            [end - begin], dtype=torch.int32, device=case.query.device
+        )
+        options = {"dtype": torch.int32, "device": case.query.device}
+        single = (
+            torch.empty((end - begin, 1, TOPK), **options),
+            torch.empty((end - begin, 1, TOPK), **options),
+            torch.empty((end - begin,), **options),
+            torch.empty((1, UNION_CAPACITY), **options),
+            torch.empty((1, UNION_CAPACITY), **options),
+            torch.empty((1,), **options),
+        )
+        result = torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8.default(
+            case.query[begin:end].contiguous(),
+            case.weights[begin:end].contiguous(),
+            case.key,
+            case.query_scale[begin:end].contiguous(),
+            case.key_scale,
+            single_actual_q,
+            case.block_table[batch_row : batch_row + 1].contiguous(),
+            case.candidate_lens[batch_row : batch_row + 1],
+            case.cache_tokens[batch_row : batch_row + 1],
+            case.req_entries[batch_row : batch_row + 1],
+            single_pool,
+            *single,
+        )
+        if result is not None:
+            raise AssertionError("C8 MTP LIM must return None")
+        torch.npu.synchronize()
+        count = int(outputs[5].cpu()[batch_row])
+        pool_row = int(case.req_entries_cpu[batch_row])
+        if (
+            not torch.equal(single[0].cpu(), outputs[0][begin:end].cpu())
+            or not torch.equal(single[1].cpu(), outputs[1][begin:end].cpu())
+            or not torch.equal(single[2].cpu(), outputs[2][begin:end].cpu())
+            or int(single[5].cpu()[0]) != count
+            or not torch.equal(
+                single_pool.cpu()[pool_row], pool.cpu()[pool_row]
+            )
+        ):
+            raise AssertionError(
+                f"request {batch_row}: isolated update differs from batched update"
+            )
+        if not torch.equal(
+            single[3][0, :count].cpu(),
+            outputs[3][batch_row, :count].cpu(),
+        ) or not torch.equal(
+            single[4][0, :count].cpu(),
+            outputs[4][batch_row, :count].cpu(),
+        ):
+            raise AssertionError(
+                f"request {batch_row}: isolated miss prefix differs"
+            )
+
+    first_sources = outputs[0].cpu()
+    first_slots = outputs[1].cpu()
+    stable_pool = pool.clone()
+    repeated = launch(case, pool)
+    torch.npu.synchronize()
+    if bool((repeated[2].cpu() != 0).any()) or bool(
+        (repeated[5].cpu() != 0).any()
+    ):
+        raise AssertionError("repeated C8 MTP update did not become zero-miss")
+    if not torch.equal(pool.cpu(), stable_pool.cpu()):
+        raise AssertionError("repeated zero-miss update changed cache state")
+    repeated_sources = repeated[0].cpu().reshape(case.query.size(0), TOPK)
+    first_sources = first_sources.reshape(case.query.size(0), TOPK)
+    repeated_slots = repeated[1].cpu().reshape(case.query.size(0), TOPK)
+    first_slots = first_slots.reshape(case.query.size(0), TOPK)
+    for row in range(case.query.size(0)):
+        if not torch.equal(
+            torch.sort(repeated_sources[row]).values,
+            torch.sort(first_sources[row]).values,
+        ):
+            raise AssertionError(
+                "repeated update changed a per-query Top-K source set"
+            )
+        if not torch.equal(
+            torch.sort(repeated_slots[row]).values,
+            torch.sort(first_slots[row]).values,
+        ):
+            raise AssertionError(
+                "repeated update changed a per-query Top-K slot set"
+            )
+
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_CHECK "
+        f"heads={case.query.size(1)} batch={len(case.actual_q_cpu)} "
+        f"packed_t={case.query.size(0)} query_counts="
+        f"{[QUERY_COUNT] * len(case.actual_q_cpu)} "
+        f"source_capacity={case.source_capacity} "
+        f"budgets={case.cache_tokens.cpu().tolist()} "
+        f"union_misses={outputs[5].cpu().tolist()} "
+        "official_c8_li_topk=1 source_range=1 union_dedup=1 "
+        "unordered_unique_pool_entries=1 guard_pool_rows=1 "
+        "hit_slots_preserved=1 "
+        "topk_src_dst_aligned=1 per_query_miss_count=1 "
+        "per_query_slots_unique=1 exact_cache_delta=1 "
+        "deterministic_fresh_replay=1 single_request_update=1 "
+        "isolated_request_match=1 repeat_zero_miss=1 "
+        "one_device_kernel=1 caller_owned_outputs=1 ok=1",
+        flush=True,
+    )
+
+
+def check_heterogeneous_candidates_and_budgets(device: torch.device) -> None:
+    case = make_case(
+        device=device,
+        batch=6,
+        heads=32,
+        source_len=20096,
+        budgets=[0, 8192, 12288, 8192, 12288, MAX_CACHE_TOKENS],
+        candidate_lens_cpu=[4096, 12288, 20096, 12288, 16384, 19968],
+        per_query_misses=64,
+        union_misses=100,
+        query_noise=0.25,
+        pool_extra=7,
+        seed=1707,
+    )
+    check_case(case)
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_HETEROGENEOUS_CHECK "
+        f"candidates={case.candidate_lens.cpu().tolist()} "
+        f"budgets={case.cache_tokens.cpu().tolist()} "
+        "candidate_tail_unchanged=1 max_cache_budget=16256 ok=1",
+        flush=True,
+    )
+
+
+def check_mixed_long_sequence_lengths(device: torch.device) -> None:
+    """Mix different Stage1 loop counts on the N=32 four-query-tile path."""
+
+    candidate_pattern = [
+        12288,
+        16384,
+        20096,
+        24576,
+        32768,
+        49152,
+        65536,
+    ]
+    budget_pattern = [8192, 12288, 8192, 16256, 12288, 16256, 12288]
+    batch = 17
+    candidates = [
+        candidate_pattern[index % len(candidate_pattern)]
+        for index in range(batch)
+    ]
+    budgets = [
+        budget_pattern[index % len(budget_pattern)]
+        for index in range(batch)
+    ]
+    case = make_case(
+        device=device,
+        batch=batch,
+        heads=32,
+        source_len=65536,
+        budgets=budgets,
+        candidate_lens_cpu=candidates,
+        per_query_misses=32,
+        union_misses=64,
+        query_noise=0.25,
+        pool_extra=5,
+        seed=4707,
+    )
+    pool = case.initial_pool.clone()
+    old_pool = pool.clone()
+    outputs = launch(case, pool)
+    torch.npu.synchronize()
+    validate_case(case, old_pool, pool, outputs)
+    if case.query.size(0) <= 64:
+        raise AssertionError("mixed-length case did not select four-query tiles")
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_MIXED_LENGTH_CHECK "
+        f"batch={batch} candidates={candidates} budgets={budgets} "
+        "source_len_min=12288 source_len_max=65536 "
+        "stage1_query_tile=4 disjoint_physical_blocks=1 ok=1",
+        flush=True,
+    )
+    del case, pool, old_pool, outputs
+    torch.npu.empty_cache()
+
+
+def check_overlapping_union_zero_miss(device: torch.device) -> None:
+    case = make_case(
+        device=device,
+        batch=1,
+        heads=32,
+        source_len=8192,
+        budgets=[8192],
+        per_query_misses=0,
+        union_misses=0,
+        query_noise=0.25,
+        pool_extra=2,
+        seed=2707,
+    )
+    union_size = len(ordered_union(case.native_topk.cpu()))
+    if union_size >= 4 * TOPK:
+        raise AssertionError("overlap case did not exercise union deduplication")
+    check_case(case)
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_OVERLAP_ZERO_MISS_CHECK "
+        f"queries=4 raw_topk_entries={4 * TOPK} union={union_size} "
+        "first_update_zero_miss=1 union_dedup=1 ok=1",
+        flush=True,
+    )
+
+
+def check_union_miss_boundaries(device: torch.device) -> None:
+    """Exercise Stage2/Stage3 count boundaries with one shared Top-K case."""
+
+    source_len = 16384
+    budget = 12288
+    base = make_case(
+        device=device,
+        batch=1,
+        heads=32,
+        source_len=source_len,
+        budgets=[budget],
+        per_query_misses=0,
+        union_misses=0,
+        query_noise=0.25,
+        pool_extra=2,
+        seed=3707,
+    )
+    rows = base.native_topk.cpu().reshape(QUERY_COUNT, TOPK).to(torch.int64)
+    union = torch.tensor(ordered_union(rows), dtype=torch.int64)
+    if union.numel() < 2048 or union.numel() > budget:
+        raise AssertionError(
+            f"boundary case requires 2048<=TopK union<=C, got {union.numel()}"
+        )
+
+    generator = torch.Generator().manual_seed(3717)
+    observed: list[int] = []
+    for target_union_miss in (1, 512, 513, 2048):
+        misses = union[:target_union_miss]
+        missing_mask = torch.zeros(source_len, dtype=torch.bool)
+        missing_mask[misses] = True
+        hits = union[~missing_mask[union]]
+        union_mask = torch.zeros(source_len, dtype=torch.bool)
+        union_mask[union] = True
+        fillers = torch.arange(source_len, dtype=torch.int64)[~union_mask]
+        filler_count = budget - int(hits.numel())
+        if filler_count < 0 or fillers.numel() < filler_count:
+            raise AssertionError(
+                f"cannot construct union-miss boundary {target_union_miss}"
+            )
+        cached = torch.cat((hits, fillers[:filler_count]))
+        if cached.numel() != budget or torch.unique(cached).numel() != budget:
+            raise AssertionError("boundary cache must contain C unique tokens")
+
+        pool_cpu = torch.full(
+            tuple(base.initial_pool.shape), POOL_GUARD, dtype=torch.int32
+        )
+        pool_row = int(base.req_entries_cpu[0])
+        pool_cpu[pool_row].fill_(-1)
+        pool_cpu[pool_row, cached] = torch.randperm(
+            budget, generator=generator, dtype=torch.int64
+        ).to(torch.int32)
+        route_misses = [
+            int(torch.isin(misses, row).sum()) for row in rows
+        ]
+        case = replace(
+            base,
+            initial_pool=pool_cpu.to(device),
+            target_union_misses=[target_union_miss],
+            target_per_query_misses=[route_misses],
+        )
+        pool = case.initial_pool.clone()
+        old_pool = pool.clone()
+        outputs = launch(case, pool)
+        torch.npu.synchronize()
+        validate_case(case, old_pool, pool, outputs)
+        actual = int(outputs[5].cpu()[0])
+        if actual != target_union_miss:
+            raise AssertionError(
+                f"union boundary produced {actual}, expected {target_union_miss}"
+            )
+        observed.append(actual)
+
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_UNION_BOUNDARY_CHECK "
+        f"union_misses={observed} split_512_513=1 large_union_2048=1 ok=1",
+        flush=True,
+    )
+
+
+def check_worst_union(device: torch.device) -> None:
+    heads = 32
+    source_len = UNION_CAPACITY * 2
+    blocks = source_len // BLOCK_SIZE
+    query_fp = torch.zeros(
+        (4, heads, 128), dtype=torch.bfloat16, device=device
+    )
+    key_fp = torch.zeros(
+        (blocks, BLOCK_SIZE, 1, 128),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    key_rows = key_fp.reshape(source_len, 1, 128)
+    key_rows[:, 0, 4] = 0.25
+    for query_row in range(4):
+        query_fp[query_row, :, query_row] = 1
+        begin = query_row * TOPK
+        key_rows[begin : begin + TOPK, 0, query_row] = 1
+    query, query_scale = quantize_fp8(query_fp)
+    key, key_scale = quantize_fp8(key_fp)
+    weights = torch.ones(
+        (4, heads), dtype=torch.bfloat16, device=device
+    )
+    actual_q = torch.tensor([4], dtype=torch.int32, device=device)
+    req = torch.tensor([1], dtype=torch.int32, device=device)
+    pool_cpu = torch.full(
+        (3, source_len), POOL_GUARD, dtype=torch.int32
+    )
+    pool_cpu[1].fill_(-1)
+    pool_cpu[1, UNION_CAPACITY:] = torch.arange(
+        UNION_CAPACITY, dtype=torch.int32
+    )
+    pool = pool_cpu.to(device)
+    budget = torch.tensor(
+        [UNION_CAPACITY], dtype=torch.int32, device=device
+    )
+    candidate = torch.tensor(
+        [source_len], dtype=torch.int32, device=device
+    )
+    block_table = torch.arange(
+        blocks, dtype=torch.int32, device=device
+    ).reshape(1, blocks)
+    native_topk = official_c8_lightning_indexer(
+        query,
+        key,
+        weights,
+        query_scale,
+        key_scale,
+        actual_q,
+        candidate,
+        block_table,
+    ).reshape(4, TOPK)
+    expected = torch.arange(UNION_CAPACITY, dtype=torch.int32).reshape(
+        4, TOPK
+    )
+    if any(
+        set(native_topk[row].cpu().tolist())
+        != set(expected[row].tolist())
+        for row in range(4)
+    ):
+        raise AssertionError("synthetic C8 MTP queries did not form an 8192 union")
+    options = {"dtype": torch.int32, "device": device}
+    outputs = (
+        torch.full((4, 1, TOPK), OUTPUT_POISON, **options),
+        torch.full((4, 1, TOPK), OUTPUT_POISON, **options),
+        torch.full((4,), OUTPUT_POISON, **options),
+        torch.full((1, UNION_CAPACITY), OUTPUT_POISON, **options),
+        torch.full((1, UNION_CAPACITY), OUTPUT_POISON, **options),
+        torch.full((1,), OUTPUT_POISON, **options),
+    )
+    result = torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8.default(
+        query,
+        weights,
+        key,
+        query_scale,
+        key_scale,
+        actual_q,
+        block_table,
+        candidate,
+        budget,
+        req,
+        pool,
+        *outputs,
+    )
+    if result is not None:
+        raise AssertionError("C8 MTP LIM must return None")
+    torch.npu.synchronize()
+    if int(outputs[5].cpu()[0]) != UNION_CAPACITY:
+        raise AssertionError("worst-case union did not report 8192 misses")
+    if not torch.equal(
+        outputs[2].cpu(),
+        torch.full((4,), TOPK, dtype=torch.int32),
+    ):
+        raise AssertionError("worst-case per-query miss counts are incorrect")
+    expected_topk_sources = expected.reshape(4, 1, TOPK)
+    if not torch.equal(outputs[0].cpu(), expected_topk_sources):
+        raise AssertionError("worst-case per-query source rows are incorrect")
+    sources = outputs[3].cpu()[0]
+    slots = outputs[4].cpu()[0]
+    if (
+        torch.unique(sources).numel() != UNION_CAPACITY
+        or set(sources.tolist()) != set(range(UNION_CAPACITY))
+        or not torch.equal(
+            torch.sort(slots).values,
+            torch.arange(UNION_CAPACITY, dtype=torch.int32),
+        )
+    ):
+        raise AssertionError("worst-case union miss buffers are incorrect")
+    updated_pool = pool.cpu()
+    if not torch.equal(updated_pool[0], pool_cpu[0]) or not torch.equal(
+        updated_pool[2], pool_cpu[2]
+    ):
+        raise AssertionError("worst-case union modified a guard pool row")
+    updated = updated_pool[1]
+    if bool((updated[:UNION_CAPACITY] < 0).any()) or bool(
+        (updated[UNION_CAPACITY:] >= 0).any()
+    ):
+        raise AssertionError("worst-case union cache update is incomplete")
+    expected_slots = updated.gather(
+        0, native_topk.cpu().reshape(-1).long()
+    ).reshape(4, 1, TOPK)
+    if not torch.equal(outputs[1].cpu(), expected_slots):
+        raise AssertionError("worst-case per-query slots are incorrect")
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_WORST_UNION_CHECK "
+        "queries=4 union=8192 misses=8192 guard_pool_rows=1 ok=1",
+        flush=True,
+    )
+
+
+def check_meta() -> None:
+    query = torch.empty(
+        (12, 32, 128), dtype=torch.float8_e4m3fn, device="meta"
+    )
+    key = torch.empty(
+        (96, BLOCK_SIZE, 1, 128),
+        dtype=torch.float8_e4m3fn,
+        device="meta",
+    )
+    weights = torch.empty((12, 32), dtype=torch.bfloat16, device="meta")
+    query_scale = torch.empty((12, 32), dtype=torch.float32, device="meta")
+    key_scale = torch.empty(
+        (96, BLOCK_SIZE, 1), dtype=torch.float32, device="meta"
+    )
+    ints = torch.empty((3,), dtype=torch.int32, device="meta")
+    pool = torch.empty((7, 12288), dtype=torch.int32, device="meta")
+    table = torch.empty((3, 96), dtype=torch.int32, device="meta")
+    topk_sources = torch.empty(
+        (12, 1, TOPK), dtype=torch.int32, device="meta"
+    )
+    topk_slots = torch.empty((12, 1, TOPK), dtype=torch.int32, device="meta")
+    topk_miss_count = torch.empty((12,), dtype=torch.int32, device="meta")
+    copy_sources = torch.empty(
+        (3, UNION_CAPACITY), dtype=torch.int32, device="meta"
+    )
+    copy_slots = torch.empty_like(copy_sources)
+    copy_counts = torch.empty((3,), dtype=torch.int32, device="meta")
+    result = torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8.default(
+        query,
+        weights,
+        key,
+        query_scale,
+        key_scale,
+        ints,
+        table,
+        ints,
+        ints,
+        ints,
+        pool,
+        topk_sources,
+        topk_slots,
+        topk_miss_count,
+        copy_sources,
+        copy_slots,
+        copy_counts,
+    )
+    if result is not None:
+        raise AssertionError("C8 MTP LIM caller-owned API must return None")
+    try:
+        torch.ops.nanovllm_dsa.fused_li_manage_mtp_c8.default(
+            query[:9],
+            weights[:9],
+            key,
+            query_scale[:9],
+            key_scale,
+            ints,
+            table,
+            ints,
+            ints,
+            ints,
+            pool,
+            topk_sources[:9],
+            topk_slots[:9],
+            topk_miss_count[:9],
+            copy_sources,
+            copy_slots,
+            copy_counts,
+        )
+    except RuntimeError as error:
+        if "only supports MTP3" not in str(error):
+            raise
+    else:
+        raise AssertionError("C8 MTP LIM accepted packed T != 4*B")
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_META_CHECK "
+        "mtp3_shape_gate=1 ok=1",
+        flush=True,
+    )
+
+
+def main() -> None:
+    args = parse_args()
+    check_args(args)
+    device = torch.device(args.device)
+    if device.type != "npu":
+        raise ValueError("--device must select an NPU")
+    torch.npu.set_device(device)
+    torch.npu.config.allow_internal_format = False
+    require_a5(device, args.allow_non_a5)
+    check_meta()
+    print(
+        "A5_FUSED_LI_MANAGE_MTP_C8_CONFIG "
+        f"opapi={nanovllm_dsa_a5.local_opapi_path()} "
+        "timing_scope=complete_stage4 "
+        "stage1_schedule=adaptive_gs1_2_or_4 "
+        "physical_key_pool=per_request_disjoint_random",
+        flush=True,
+    )
+
+    if args.only_mixed:
+        # BISECT：只跑 batch=17 大 candidate mixed 检查，快速复现 507015。
+        check_mixed_long_sequence_lengths(device)
+        return
+
+    for heads in args.heads:
+        budgets = [args.cache_tokens] * args.batch_size
+        if args.first_request_c0:
+            budgets[0] = 0
+        case = make_case(
+            device=device,
+            batch=args.batch_size,
+            heads=heads,
+            source_len=args.source_len,
+            budgets=budgets,
+            per_query_misses=args.per_query_miss_count,
+            union_misses=args.union_miss_count,
+            query_noise=args.query_noise,
+            pool_extra=args.pool_extra,
+            seed=args.seed + heads,
+        )
+        check_case(case)
+        per_query_misses = per_query_miss_counts(case)
+        official_mean_us, fused_mean_us = benchmark(
+            case, args.warmup, args.iters
+        )
+        stage1_query_tile = (
+            4 if heads == 32 and case.query.size(0) > 64 else 2
+        )
+        print(
+            "A5_FUSED_LI_MANAGE_MTP_C8_RESULT "
+            f"heads={heads} batch={args.batch_size} packed_t={case.query.size(0)} "
+            f"queries_per_request={QUERY_COUNT} "
+            f"source_len={args.source_len} C={budgets[0] if len(set(budgets)) == 1 else 'mixed'} "
+            f"target_per_query_miss={args.per_query_miss_count} "
+            f"target_union_miss={args.union_miss_count} "
+            f"union_miss_mean={statistics.mean(case.target_union_misses):.3f} "
+            f"per_query_miss_mean={statistics.mean(per_query_misses):.3f} "
+            f"per_query_miss_range={min(per_query_misses)}:{max(per_query_misses)} "
+            f"official_c8_li_mtp_avg_us={official_mean_us:.3f} "
+            "official_c8_li_layout=TND_sparse3_causal "
+            f"lim_mtp_c8_avg_us={fused_mean_us:.3f} "
+            f"stage1_query_tile={stage1_query_tile} "
+            "optimization_stage=4 "
+            "timer=queued_npu_event cache_reset_each_iter=1 "
+            "performance_assert=0 "
+            f"warmup={args.warmup} iters={args.iters}",
+            flush=True,
+        )
+        del case
+        torch.npu.empty_cache()
+
+    check_heterogeneous_candidates_and_budgets(device)
+    check_mixed_long_sequence_lengths(device)
+    check_union_miss_boundaries(device)
+    check_overlapping_union_zero_miss(device)
+    check_worst_union(device)
+    print("A5_FUSED_LI_MANAGE_MTP_C8_UT_OK", flush=True)
+
+
+if __name__ == "__main__":
+    main()

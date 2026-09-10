@@ -1,0 +1,15 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(python -c ' *)",
+      "Bash(python build/_check2.py)",
+      "Bash(rm -f build/_check2.py)",
+      "Bash(echo \"grep exit=$?\")",
+      "Bash(echo \"exit=$?\")",
+      "Bash(echo \"---exit=$?\")",
+      "Bash(python build/_check3.py)",
+      "Bash(rm -f build/_check3.py)"
+    ]
+  }
+}

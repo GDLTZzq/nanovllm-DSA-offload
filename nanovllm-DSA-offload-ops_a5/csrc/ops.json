@@ -1,0 +1,240 @@
+[
+    {
+        "op": "A5FusedLiManage",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "weights", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "req_pool_entries", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "cache_slots_pool", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "candidate_lens", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "block_table", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "source_ids", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "destination_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "cache_slots_alias", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "attr": []
+    },
+    {
+        "op": "A5FusedLiManageMtp",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "weights", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "cache_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_key", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "block_table", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "topk_index", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "topk_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_index", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "miss_count", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "attr": []
+    },
+    {
+        "op": "A5FusedLiManageC8",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "weights", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "query_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "key_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_slots_pool", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "source_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_slots_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "attr": []
+    },
+    {
+        "op": "A5FusedLiManageMtpC8",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "weights", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "query_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "key_dequant_scale", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "actual_seq_lengths_query", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "req_pool_entries", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_slots_pool", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "candidate_lens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "topk_source_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "topk_destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "topk_miss_count", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_source_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "miss_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_slots_alias", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "attr": []
+    },
+    {
+        "op": "A5KvcacheScatterCopy",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "hbm_k_rope", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "hbm_kv_cache", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "dram_k_rope", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "dram_kv_cache", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "hbm_block_table", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "dram_block_table", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "src_token_ids", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "dst_slots", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "copy_counts", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "hbm_k_rope_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "hbm_kv_cache_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]}
+        ],
+        "attr": []
+    },
+    {
+        "op": "A5KvcacheScatterCopyC8",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "source_token_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "destination_slots", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "copy_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "hbm_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "dram_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "hbm_kv", "param_type": "required", "format": ["ND"], "type": ["int8"]},
+            {"name": "dram_kv", "param_type": "required", "format": ["ND"], "type": ["int8"]}
+        ],
+        "output_desc": [
+            {"name": "hbm_kv_out", "param_type": "required", "format": ["ND"], "type": ["int8"]}
+        ],
+        "attr": []
+    },
+    {
+        "op": "A5SparseTailAttentionC8",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "value", "param_type": "required", "format": ["ND"], "type": ["uint8"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "key_dequant_scale", "param_type": "optional", "format": ["ND"], "type": ["float"]},
+            {"name": "value_dequant_scale", "param_type": "optional", "format": ["ND"], "type": ["float"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "softmax_max", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "softmax_sum", "param_type": "required", "format": ["ND"], "type": ["float"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "key_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "value_quant_mode", "param_type": "required", "type": "int"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "quant_scale_repo_mode", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "tile_size", "param_type": "optional", "type": "int", "default_value": 128},
+            {"name": "rope_head_dim", "param_type": "optional", "type": "int", "default_value": 64},
+            {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false}
+        ]
+    },
+    {
+        "op": "A5SparseTailAttention",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "value", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND", "ND"], "type": ["int32", "int32"]},
+            {"name": "query_rope", "param_type": "optional", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "key_rope", "param_type": "optional", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND", "ND"], "type": ["int32", "int32"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND", "ND"], "type": ["bf16", "fp16"]},
+            {"name": "softmax_max", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]},
+            {"name": "softmax_sum", "param_type": "required", "format": ["ND", "ND"], "type": ["float", "float"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false}
+        ]
+    },
+    {
+        "op": "A5FusedCopySparseTailAttention",
+        "language": "cpp",
+        "input_desc": [
+            {"name": "query", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "key", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "value", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "sparse_indices", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "block_table", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_query", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "actual_seq_lengths_kv", "param_type": "optional", "format": ["ND"], "type": ["int32"]},
+            {"name": "query_rope", "param_type": "optional", "format": ["ND"], "type": ["bf16"]},
+            {"name": "key_rope", "param_type": "optional", "format": ["ND"], "type": ["bf16"]},
+            {"name": "cache_tokens", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "dram_key_rope", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "dram_kv_cache", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "dram_block_table", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "source_token_ids", "param_type": "required", "format": ["ND"], "type": ["int32"]},
+            {"name": "copy_counts", "param_type": "required", "format": ["ND"], "type": ["int32"]}
+        ],
+        "output_desc": [
+            {"name": "attention_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "softmax_max", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "softmax_sum", "param_type": "required", "format": ["ND"], "type": ["float"]},
+            {"name": "hbm_key_rope_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]},
+            {"name": "hbm_kv_cache_out", "param_type": "required", "format": ["ND"], "type": ["bf16"]}
+        ],
+        "attr": [
+            {"name": "scale_value", "param_type": "required", "type": "float"},
+            {"name": "sparse_block_size", "param_type": "optional", "type": "int", "default_value": 1},
+            {"name": "layout_query", "param_type": "optional", "type": "string", "default_value": "TND"},
+            {"name": "layout_kv", "param_type": "optional", "type": "string", "default_value": "PA_BSND"},
+            {"name": "sparse_mode", "param_type": "optional", "type": "int", "default_value": 3},
+            {"name": "pre_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "next_tokens", "param_type": "optional", "type": "int", "default_value": 9223372036854775807},
+            {"name": "attention_mode", "param_type": "optional", "type": "int", "default_value": 2},
+            {"name": "return_softmax_lse", "param_type": "optional", "type": "bool", "default_value": false},
+            {"name": "prefetch_rows_per_step", "param_type": "optional", "type": "int", "default_value": 5}
+        ]
+    }
+]
