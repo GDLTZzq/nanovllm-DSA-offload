@@ -29,10 +29,10 @@ export PYTHONPATH=$PWD/torch_extension:$PYTHONPATH
 export SOC_VERSION=ascend950
 export NANOVLLM_A5_OPS_PYTHON=python3
 export NANOVLLM_A5_OPS_BUILD_JOBS=64
-bash build_bf16.sh
-export ASCEND_CUSTOM_OPP_PATH=$PWD/_custom_opp_bf16/vendors/customize
-export NANOVLLM_A5_INSTALL_OPP_PATH=$PWD/_custom_opp_bf16
-export NANOVLLM_CUST_OPAPI_LIB=$PWD/_custom_opp_bf16/vendors/customize/op_api/lib/libcust_opapi.so
+bash build_c8.sh
+export ASCEND_CUSTOM_OPP_PATH=$PWD/_custom_opp_c8/vendors/customize
+export NANOVLLM_A5_INSTALL_OPP_PATH=$PWD/_custom_opp_c8
+export NANOVLLM_CUST_OPAPI_LIB=$PWD/_custom_opp_c8/vendors/customize/op_api/lib/libcust_opapi.so
 ```
 
 ## 测试
